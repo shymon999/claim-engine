@@ -334,30 +334,8 @@ class ClaimProcessor:
 
 @st.cache_resource
 def get_session():
-    # Read secrets safely
-    turso_url = os.environ.get("TURSO_DATABASE_URL", "")
-    turso_token = os.environ.get("TURSO_AUTH_TOKEN", "")
-    try:
-        if not turso_url: turso_url = st.secrets.get("TURSO_DATABASE_URL", "")
-        if not turso_token: turso_token = st.secrets.get("TURSO_AUTH_TOKEN", "")
-    except Exception:
-        pass
-
-    if turso_url and turso_token:
-        # Embedded replica: local SQLite synced with Turso cloud
-        db_path = "/tmp/claim_engine_turso.db"
-        engine = create_engine(
-            f"sqlite+libsql:///{db_path}",
-            connect_args={
-                "auth_token": turso_token,
-                "sync_url": turso_url,
-            },
-            pool_pre_ping=True,
-        )
-    else:
-        # Pure local SQLite fallback
-        db_path = "/tmp/claim_engine_v2.db"
-        engine = create_engine(f"sqlite:///{db_path}", connect_args={"check_same_thread": False})
+    db_path = "/tmp/claim_engine_v2.db"
+    engine = create_engine(f"sqlite:///{db_path}", connect_args={"check_same_thread": False})
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine)
     session = Session()
