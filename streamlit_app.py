@@ -168,6 +168,9 @@ class ClaimProcessor:
         self.session.commit()
         return pd.DataFrame(results)
 
+    def get_stats(self):
+        return dict(self.load_counter)
+
     def _assign_claim(self, row):
         shipment = str(row.get('Shipment number', '')).strip()
         country = str(row.get('DSV Country (Lookup)', '')).strip()
@@ -331,8 +334,20 @@ class ClaimProcessor:
 
 @st.cache_resource
 def get_session():
-    os.makedirs('data', exist_ok=True)
-    engine = create_engine('sqlite:///data/claim_engine_v2.db', connect_args={"check_same_thread": False})
+    # Turso cloud DB (when deployed) or local SQLite (for development)
+    turso_url = os.environ.get("TURSO_DATABASE_URL") or st.secrets.get("TURSO_DATABASE_URL", "")
+    turso_token = os.environ.get("TURSO_AUTH_TOKEN") or st.secrets.get("TURSO_AUTH_TOKEN", "")
+
+    if turso_url and turso_token:
+        # Remote Turso — persistent cloud database
+        engine = create_engine(
+            f"sqlite+libsql://{turso_url.replace('libsql://', '').replace('https://', '')}?secure=true",
+            connect_args={"auth_token": turso_token},
+        )
+    else:
+        # Local SQLite — for development / testing
+        os.makedirs('data', exist_ok=True)
+        engine = create_engine('sqlite:///data/claim_engine_v2.db', connect_args={"check_same_thread": False})
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine)
     session = Session()
@@ -525,7 +540,11 @@ def get_session():
 def main():
     session = get_session()
 
-    # Sidebar: Team selection
+    # Admin authentication
+    if 'is_admin' not in st.session_state:
+        st.session_state['is_admin'] = False
+
+    # Sidebar: Team selection + Admin login
     with st.sidebar:
         st.title("🎯 Claim Engine v2.0")
         teams = session.query(Team).all()
@@ -549,8 +568,35 @@ def main():
         ])
 
         st.divider()
-        st.caption(f"DB: data/claim_engine_v2.db")
+
+        # Admin login/logout
+        admin_pw = os.environ.get("ADMIN_PASSWORD") or ""
+        try:
+            admin_pw = admin_pw or st.secrets.get("ADMIN_PASSWORD", "")
+        except: pass
+
+        if st.session_state['is_admin']:
+            st.success("🔓 Admin")
+            if st.button("Wyloguj"):
+                st.session_state['is_admin'] = False
+                st.rerun()
+        else:
+            st.caption("🔒 Tryb podglądu")
+            with st.expander("🔑 Admin login"):
+                pw = st.text_input("Hasło", type="password", key="admin_pw_input")
+                if st.button("Zaloguj"):
+                    if admin_pw and pw == admin_pw:
+                        st.session_state['is_admin'] = True
+                        st.rerun()
+                    elif not admin_pw:
+                        st.error("Brak ADMIN_PASSWORD w Secrets!")
+                    else:
+                        st.error("Złe hasło")
+
+        st.divider()
         st.caption(f"v2.0 • Streamlit Edition")
+
+    is_admin = st.session_state['is_admin']
 
     # ====================================================================
     # PROCESS CLAIMS
@@ -581,7 +627,7 @@ def main():
 
             # Stats
             col1, col2, col3 = st.columns(3)
-            assigned = len(result_df[result_df.get('Assigned Name', pd.Series()) != '#N/A'])
+            assigned = len(result_df[result_df['Assigned Name'] != '#N/A']) if 'Assigned Name' in result_df.columns else 0
             unmatched = len(result_df) - assigned
             col1.metric("Total", len(result_df))
             col2.metric("Assigned", assigned)
@@ -648,6 +694,8 @@ def main():
             st.dataframe(pd.DataFrame(data), use_container_width=True, hide_index=True, height=400)
 
         # Add / Edit / Delete
+        if not is_admin:
+            st.info("🔒 Zaloguj się jako admin aby edytować reguły.")
         st.subheader("Manage Rules")
         tab_add, tab_edit, tab_del = st.tabs(["➕ Add", "✏️ Edit", "🗑️ Delete"])
 
@@ -674,7 +722,7 @@ def main():
                 out_assigned = col2.selectbox("Output Assigned Name", ['', '#N/A'])
                 is_active = st.checkbox("Active", True)
 
-                if st.form_submit_button("💾 Save Rule", type="primary"):
+                if st.form_submit_button("💾 Save Rule", type="primary", disabled=not is_admin):
                     r = Rule(
                         team_id=team.id, priority=priority, description=desc or None,
                         is_active=is_active,
@@ -739,7 +787,7 @@ def main():
                     out_assigned = col2.selectbox("Output Assigned", ['', '#N/A'], index=oa_idx, key="ed_oa")
                     is_active = st.checkbox("Active", rule.is_active, key="ed_act")
 
-                    if st.form_submit_button("💾 Update Rule", type="primary"):
+                    if st.form_submit_button("💾 Update Rule", type="primary", disabled=not is_admin):
                         rule.description = desc or None; rule.priority = priority
                         rule.countries = countries.strip() or None
                         rule.divisions = ','.join(divs) or None
@@ -758,7 +806,7 @@ def main():
             if rules:
                 rule_del_opts = {f"#{r.id} [P{r.priority}] {r.description or r.countries or '?'}": r.id for r in rules}
                 sel = st.selectbox("Select rule to delete", list(rule_del_opts.keys()), key="del_rule_sel")
-                if st.button("🗑️ Delete Rule", type="secondary"):
+                if st.button("🗑️ Delete Rule", disabled=not is_admin, type="secondary"):
                     r = session.get(Rule, rule_del_opts[sel])
                     if r: session.delete(r); session.commit(); st.success("Deleted!"); st.rerun()
 
@@ -767,6 +815,7 @@ def main():
     # ====================================================================
     elif page == "⭐ VIP Customers":
         st.header("⭐ VIP Customers")
+        if not is_admin: st.info("🔒 Zaloguj się jako admin aby edytować.")
         st.info("Checked BEFORE rules. Matched by claimant name + country + amount range.")
 
         vips = session.query(VIPCustomer).order_by(VIPCustomer.priority).all()
@@ -790,7 +839,7 @@ def main():
                 mn = col1.number_input("Min EUR", 0, 999999, 0)
                 mx = col2.number_input("Max EUR", 0, 999999, 999999)
                 prio = col3.number_input("Priority", 1, 999, 10)
-                if st.form_submit_button("💾 Save"):
+                if st.form_submit_button("💾 Save", disabled=not is_admin):
                     session.add(VIPCustomer(customer_name=name, country=country.strip() or None,
                         handler_id=all_h[handler], min_amount=mn, max_amount=mx, priority=prio))
                     session.commit(); st.success("Added!"); st.rerun()
@@ -811,7 +860,7 @@ def main():
                     mn = col1.number_input("Min", 0, 999999, int(vip.min_amount), key="ev_mn")
                     mx = col2.number_input("Max", 0, 999999, int(vip.max_amount), key="ev_mx")
                     prio = col3.number_input("Prio", 1, 999, vip.priority, key="ev_p")
-                    if st.form_submit_button("💾 Update"):
+                    if st.form_submit_button("💾 Update", disabled=not is_admin):
                         vip.customer_name = name; vip.country = country.strip() or None
                         vip.handler_id = all_h[handler]; vip.min_amount = mn
                         vip.max_amount = mx; vip.priority = prio
@@ -821,7 +870,7 @@ def main():
             if vips:
                 opts = {f"{v.customer_name} ({v.country or 'ANY'})": v.id for v in vips}
                 sel = st.selectbox("Select VIP to delete", list(opts.keys()), key="del_vip")
-                if st.button("🗑️ Delete VIP"):
+                if st.button("🗑️ Delete VIP", disabled=not is_admin):
                     v = session.get(VIPCustomer, opts[sel])
                     if v: session.delete(v); session.commit(); st.rerun()
 
@@ -830,6 +879,7 @@ def main():
     # ====================================================================
     elif page == "🏢 Special Customers":
         st.header("🏢 Special Customers (Global)")
+        if not is_admin: st.info("🔒 Zaloguj się jako admin aby edytować.")
         st.info("Checked FIRST. e.g. Abbott, LEGO, Adidas → dedicated handlers.")
 
         specials = session.query(SpecialCustomer).order_by(SpecialCustomer.customer_name).all()
@@ -846,7 +896,7 @@ def main():
             with st.form("add_special"):
                 name = st.text_input("Customer name (contains)")
                 handlers = st.multiselect("Handlers", list(all_h.keys()))
-                if st.form_submit_button("💾 Save"):
+                if st.form_submit_button("💾 Save", disabled=not is_admin):
                     hids = ','.join(str(all_h[h]) for h in handlers)
                     session.add(SpecialCustomer(customer_name=name, handler_ids=hids))
                     session.commit(); st.success("Added!"); st.rerun()
@@ -855,7 +905,7 @@ def main():
             if specials:
                 opts = {s.customer_name: s.id for s in specials}
                 sel = st.selectbox("Select to delete", list(opts.keys()), key="del_sc")
-                if st.button("🗑️ Delete"):
+                if st.button("🗑️ Delete", disabled=not is_admin):
                     s = session.get(SpecialCustomer, opts[sel])
                     if s: session.delete(s); session.commit(); st.rerun()
 
@@ -864,6 +914,7 @@ def main():
     # ====================================================================
     elif page == "🚛 Schenker Config":
         st.header("🚛 Schenker Merge Configuration")
+        if not is_admin: st.info("🔒 Zaloguj się jako admin aby edytować.")
         st.info("Shipments without DSV dash are checked here. Country + division + merge month in 2025.")
 
         configs = session.query(SchenkerConfig).filter_by(is_active=True).order_by(
@@ -879,14 +930,14 @@ def main():
                 country = st.text_input("Country")
                 div = st.selectbox("Division", ['all'] + DIVISIONS)
                 month = st.number_input("Merge Month (2025)", 1, 12, 8)
-                if st.form_submit_button("💾 Save"):
+                if st.form_submit_button("💾 Save", disabled=not is_admin):
                     session.add(SchenkerConfig(country=country, division=div, merge_month=month))
                     session.commit(); st.success("Added!"); st.rerun()
         with tab_del:
             if configs:
                 opts = {f"{c.country} / {c.division} / month {c.merge_month}": c.id for c in configs}
                 sel = st.selectbox("Select", list(opts.keys()), key="del_sch")
-                if st.button("🗑️ Delete"):
+                if st.button("🗑️ Delete", disabled=not is_admin):
                     c = session.get(SchenkerConfig, opts[sel])
                     if c: session.delete(c); session.commit(); st.rerun()
 
@@ -895,6 +946,7 @@ def main():
     # ====================================================================
     elif page == "👥 Handlers":
         st.header(f"👥 Handlers — {selected_display}")
+        if not is_admin: st.info("🔒 Zaloguj się jako admin aby edytować.")
 
         handlers = session.query(Handler).filter_by(team_id=team.id).order_by(Handler.team_name, Handler.name).all()
         if handlers:
@@ -915,7 +967,7 @@ def main():
                 rid = st.text_input("Riskonnect ID")
                 tname = st.selectbox("Team Name", TEAM_NAMES[:4])
                 backup = st.selectbox("Backup Handler", ['-- None --'] + list(all_handlers_for_backup.keys()))
-                if st.form_submit_button("💾 Save"):
+                if st.form_submit_button("💾 Save", disabled=not is_admin):
                     if name and rid:
                         bk_id = all_handlers_for_backup.get(backup) if backup != '-- None --' else None
                         session.add(Handler(name=name, riskonnect_id=rid, team_name=tname,
@@ -938,7 +990,7 @@ def main():
                         key = f"{h.backup_handler.name} [{h.backup_handler.team_name}]"
                         if key in bk_opts: cur_bk = key
                     backup = st.selectbox("Backup", bk_opts, index=bk_opts.index(cur_bk), key="eh_bk")
-                    if st.form_submit_button("💾 Update"):
+                    if st.form_submit_button("💾 Update", disabled=not is_admin):
                         h.name = name; h.riskonnect_id = rid; h.team_name = tname
                         h.backup_handler_id = all_handlers_for_backup.get(backup) if backup != '-- None --' else None
                         session.commit(); st.success("Updated!"); st.rerun()
@@ -947,7 +999,7 @@ def main():
             if handlers:
                 opts = {f"{h.name} ({h.riskonnect_id})": h.id for h in handlers}
                 sel = st.selectbox("Select to delete", list(opts.keys()), key="del_h")
-                if st.button("🗑️ Delete Handler"):
+                if st.button("🗑️ Delete Handler", disabled=not is_admin):
                     h = session.get(Handler, opts[sel])
                     if h: session.delete(h); session.commit(); st.rerun()
 
@@ -956,14 +1008,15 @@ def main():
     # ====================================================================
     elif page == "📅 Attendance":
         st.header(f"📅 Attendance — {selected_display}")
+        if not is_admin: st.info("🔒 Zaloguj się jako admin aby edytować.")
 
         handlers = session.query(Handler).filter_by(team_id=team.id).order_by(Handler.team_name, Handler.name).all()
 
         col1, col2, _ = st.columns([1, 1, 3])
-        if col1.button("✅ All Present"):
+        if col1.button("✅ All Present", disabled=not is_admin):
             for h in handlers: h.is_present = True
             session.commit(); st.rerun()
-        if col2.button("❌ All Absent"):
+        if col2.button("❌ All Absent", disabled=not is_admin):
             for h in handlers: h.is_present = False
             session.commit(); st.rerun()
 
@@ -976,7 +1029,8 @@ def main():
             new_val = st.checkbox(
                 f"{h.name}  `{h.riskonnect_id}`",
                 value=h.is_present,
-                key=f"att_{h.id}"
+                key=f"att_{h.id}",
+                disabled=not is_admin
             )
             if new_val != h.is_present:
                 h.is_present = new_val
@@ -987,6 +1041,7 @@ def main():
     # ====================================================================
     elif page == "🏷️ Sub-Types":
         st.header("🏷️ Claim Sub-Types")
+        if not is_admin: st.info("🔒 Zaloguj się jako admin aby edytować.")
 
         subtypes = session.query(ClaimSubType).order_by(ClaimSubType.category, ClaimSubType.name).all()
         if subtypes:
@@ -999,14 +1054,14 @@ def main():
             with st.form("add_st"):
                 name = st.text_input("Name")
                 cat = st.selectbox("Category", ['damage', 'manco', 'other', ''])
-                if st.form_submit_button("➕ Add"):
+                if st.form_submit_button("➕ Add", disabled=not is_admin):
                     session.add(ClaimSubType(name=name, category=cat or None))
                     session.commit(); st.rerun()
         with col2:
             if subtypes:
                 opts = {s.name: s.id for s in subtypes}
                 sel = st.selectbox("Delete sub-type", list(opts.keys()))
-                if st.button("🗑️ Delete"):
+                if st.button("🗑️ Delete", disabled=not is_admin):
                     s = session.get(ClaimSubType, opts[sel])
                     if s: session.delete(s); session.commit(); st.rerun()
 
@@ -1027,7 +1082,7 @@ def main():
         else:
             st.info("No history yet. Process some claims first.")
 
-        if st.button("🗑️ Clear All History"):
+        if st.button("🗑️ Clear All History", disabled=not is_admin):
             session.query(History).delete(); session.commit(); st.rerun()
 
 
