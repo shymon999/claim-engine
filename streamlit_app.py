@@ -996,17 +996,8 @@ def main():
     # ====================================================================
     elif page == "📅 Attendance":
         st.header(f"📅 Attendance — {selected_display}")
-        if not is_admin: st.info("🔒 Zaloguj się jako admin aby edytować.")
 
         handlers = session.query(Handler).filter_by(team_id=team.id).order_by(Handler.team_name, Handler.name).all()
-
-        col1, col2, _ = st.columns([1, 1, 3])
-        if col1.button("✅ All Present", disabled=not is_admin):
-            for h in handlers: h.is_present = True
-            session.commit(); st.rerun()
-        if col2.button("❌ All Absent", disabled=not is_admin):
-            for h in handlers: h.is_present = False
-            session.commit(); st.rerun()
 
         current_team = None
         for h in handlers:
@@ -1017,8 +1008,7 @@ def main():
             new_val = st.checkbox(
                 f"{h.name}  `{h.riskonnect_id}`",
                 value=h.is_present,
-                key=f"att_{h.id}",
-                disabled=not is_admin
+                key=f"att_{h.id}"
             )
             if new_val != h.is_present:
                 h.is_present = new_val
