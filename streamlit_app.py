@@ -334,20 +334,26 @@ class ClaimProcessor:
 
 @st.cache_resource
 def get_session():
-    # Turso cloud DB (when deployed) or local SQLite (for development)
-    turso_url = os.environ.get("TURSO_DATABASE_URL") or st.secrets.get("TURSO_DATABASE_URL", "")
-    turso_token = os.environ.get("TURSO_AUTH_TOKEN") or st.secrets.get("TURSO_AUTH_TOKEN", "")
+    # Read secrets safely (st.secrets can crash if file missing)
+    turso_url = os.environ.get("TURSO_DATABASE_URL", "")
+    turso_token = os.environ.get("TURSO_AUTH_TOKEN", "")
+    try:
+        if not turso_url: turso_url = st.secrets.get("TURSO_DATABASE_URL", "")
+        if not turso_token: turso_token = st.secrets.get("TURSO_AUTH_TOKEN", "")
+    except Exception:
+        pass
 
     if turso_url and turso_token:
         # Remote Turso — persistent cloud database
+        host = turso_url.replace("libsql://", "").replace("https://", "").strip("/")
         engine = create_engine(
-            f"sqlite+libsql://{turso_url.replace('libsql://', '').replace('https://', '')}?secure=true",
+            f"sqlite+libsql://{host}?secure=true",
             connect_args={"auth_token": turso_token},
         )
     else:
-        # Local SQLite — for development / testing
-        os.makedirs('data', exist_ok=True)
-        engine = create_engine('sqlite:///data/claim_engine_v2.db', connect_args={"check_same_thread": False})
+        # Local / Streamlit Cloud fallback — SQLite in /tmp (always writable)
+        db_path = "/tmp/claim_engine_v2.db"
+        engine = create_engine(f"sqlite:///{db_path}", connect_args={"check_same_thread": False})
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine)
     session = Session()
