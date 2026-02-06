@@ -334,7 +334,7 @@ class ClaimProcessor:
 
 @st.cache_resource
 def get_session():
-    # Read secrets safely (st.secrets can crash if file missing)
+    # Read secrets safely
     turso_url = os.environ.get("TURSO_DATABASE_URL", "")
     turso_token = os.environ.get("TURSO_AUTH_TOKEN", "")
     try:
@@ -344,14 +344,18 @@ def get_session():
         pass
 
     if turso_url and turso_token:
-        # Remote Turso — persistent cloud database
-        host = turso_url.replace("libsql://", "").replace("https://", "").strip("/")
+        # Embedded replica: local SQLite synced with Turso cloud
+        db_path = "/tmp/claim_engine_turso.db"
         engine = create_engine(
-            f"sqlite+libsql://{host}?secure=true",
-            connect_args={"auth_token": turso_token},
+            f"sqlite+libsql:///{db_path}",
+            connect_args={
+                "auth_token": turso_token,
+                "sync_url": turso_url,
+            },
+            pool_pre_ping=True,
         )
     else:
-        # Local / Streamlit Cloud fallback — SQLite in /tmp (always writable)
+        # Pure local SQLite fallback
         db_path = "/tmp/claim_engine_v2.db"
         engine = create_engine(f"sqlite:///{db_path}", connect_args={"check_same_thread": False})
     Base.metadata.create_all(engine)
