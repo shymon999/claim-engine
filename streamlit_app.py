@@ -7,7 +7,7 @@ import pandas as pd
 import os, io
 from datetime import datetime, timedelta
 from collections import Counter
-from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, DateTime, ForeignKey, Text, pool
+from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, DateTime, ForeignKey, Text, pool, event
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 
 st.set_page_config(page_title="Claim Engine", page_icon="🎯", layout="wide")
@@ -379,18 +379,41 @@ def get_session():
 
     if turso_url and turso_token:
         # Remote Turso — persistent cloud database
-        # Clean the URL: remove protocol prefixes  
-        clean_url = turso_url.replace('libsql://', '').replace('https://', '')
+        # Convert libsql:// to https:// for connection
+        if turso_url.startswith('libsql://'):
+            https_url = turso_url.replace('libsql://', 'https://')
+        elif turso_url.startswith('https://'):
+            https_url = turso_url
+        else:
+            https_url = f"https://{turso_url}"
         
-        # Create engine with libsql compatibility settings
+        # Create engine for Turso - use sqlite+libsql:// prefix with https URL
         engine = create_engine(
-            f"sqlite+libsql://{clean_url}",
+            f"sqlite+libsql://{https_url}",
             connect_args={"auth_token": turso_token},
-            poolclass=pool.StaticPool,  # Use StaticPool for cloud database
-            isolation_level=None,       # Disable isolation level checks
-            pool_pre_ping=False,        # Disable connection ping
+            poolclass=pool.StaticPool,
             echo=False
         )
+        
+        # Workaround for libsql PRAGMA incompatibility
+        # Override the get_isolation_level method to avoid PRAGMA queries
+        from sqlalchemy.dialects.sqlite import base
+        
+        original_get_isolation = base.SQLiteDialect.get_isolation_level
+        original_set_isolation = base.SQLiteDialect.set_isolation_level
+        
+        def _skip_isolation_get(self, dbapi_connection):
+            """Skip isolation level check for libsql"""
+            return None
+        
+        def _skip_isolation_set(self, dbapi_connection, level):
+            """Skip isolation level set for libsql"""
+            pass
+        
+        # Apply monkey patch for this engine
+        base.SQLiteDialect.get_isolation_level = _skip_isolation_get
+        base.SQLiteDialect.set_isolation_level = _skip_isolation_set
+        
     else:
         # Local SQLite — for development / testing
         os.makedirs('data', exist_ok=True)
