@@ -390,10 +390,8 @@ def get_session():
             echo=False
         )
         
-        # Monkey patch to avoid PRAGMA queries
+        # Monkey-patch to avoid PRAGMA queries (Turso doesn't support them)
         from sqlalchemy.dialects.sqlite import base
-        from sqlalchemy import event as sqla_event
-        from sqlalchemy.schema import CreateTable
         
         def _skip_isolation_get(self, dbapi_connection):
             return None
@@ -404,23 +402,13 @@ def get_session():
         base.SQLiteDialect.get_isolation_level = _skip_isolation_get
         base.SQLiteDialect.set_isolation_level = _skip_isolation_set
         
-        # Add IF NOT EXISTS to all CREATE TABLE statements
-        @sqla_event.listens_for(Base.metadata, "before_create")
-        def receive_before_create(target, connection, **kw):
-            """Modify CREATE TABLE to include IF NOT EXISTS"""
-            pass
-        
-        # Alternative: compile with IF NOT EXISTS
-        from sqlalchemy.ext.compiler import compiles
+        # Create tables with IF NOT EXISTS — avoids both PRAGMA and duplicate errors
         from sqlalchemy.schema import CreateTable
-        
-        @compiles(CreateTable, "sqlite")
-        def _compile_create_table(element, compiler, **kw):
-            """Add IF NOT EXISTS to CREATE TABLE for SQLite/libsql"""
-            text = compiler.visit_create_table(element, **kw)
-            # Insert IF NOT EXISTS after CREATE TABLE
-            text = text.replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS")
-            return text
+        with engine.connect() as conn:
+            for table in Base.metadata.sorted_tables:
+                stmt = CreateTable(table, if_not_exists=True)
+                conn.execute(stmt)
+            conn.commit()
         
     else:
         # Local SQLite — for development / testing
@@ -429,9 +417,7 @@ def get_session():
             'sqlite:///data/claim_engine.db',
             connect_args={"check_same_thread": False}
         )
-    
-    # Create tables - with IF NOT EXISTS for Turso, checkfirst=False avoids PRAGMA
-    Base.metadata.create_all(engine, checkfirst=True)
+        Base.metadata.create_all(engine)
     
     Session = sessionmaker(bind=engine)
     session = Session()
