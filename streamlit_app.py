@@ -379,17 +379,12 @@ def get_session():
 
     if turso_url and turso_token:
         # Remote Turso — persistent cloud database
-        # Convert libsql:// to https:// for connection
-        if turso_url.startswith('libsql://'):
-            https_url = turso_url.replace('libsql://', 'https://')
-        elif turso_url.startswith('https://'):
-            https_url = turso_url
-        else:
-            https_url = f"https://{turso_url}"
+        # Extract hostname from URL (remove protocol)
+        clean_url = turso_url.replace('libsql://', '').replace('https://', '')
         
-        # Create engine for Turso - use sqlite+libsql:// prefix with https URL
+        # Create engine for Turso - use just the hostname
         engine = create_engine(
-            f"sqlite+libsql://{https_url}",
+            f"sqlite+libsql://{clean_url}",
             connect_args={"auth_token": turso_token},
             poolclass=pool.StaticPool,
             echo=False
@@ -398,9 +393,6 @@ def get_session():
         # Workaround for libsql PRAGMA incompatibility
         # Override the get_isolation_level method to avoid PRAGMA queries
         from sqlalchemy.dialects.sqlite import base
-        
-        original_get_isolation = base.SQLiteDialect.get_isolation_level
-        original_set_isolation = base.SQLiteDialect.set_isolation_level
         
         def _skip_isolation_get(self, dbapi_connection):
             """Skip isolation level check for libsql"""
