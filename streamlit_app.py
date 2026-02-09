@@ -1,5 +1,5 @@
 """
-CLAIM ENGINE v2.0 — Streamlit Web Edition
+CLAIM ENGINE — Streamlit Web Edition
 Deploy free on Streamlit Community Cloud.
 """
 import streamlit as st
@@ -10,7 +10,7 @@ from collections import Counter
 from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, DateTime, ForeignKey, Text
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 
-st.set_page_config(page_title="Claim Engine v2.0", page_icon="🎯", layout="wide")
+st.set_page_config(page_title="Claim Engine", page_icon="🎯", layout="wide")
 
 Base = declarative_base()
 
@@ -166,7 +166,28 @@ class ClaimProcessor:
             self._log_history(row, handler, team_name, rid, reason)
             results.append(self._build_output(row, handler, team_name, rid, reason))
         self.session.commit()
-        return pd.DataFrame(results)
+        output_df = pd.DataFrame(results)
+        
+        # Reorder columns: ensure Claim Handler is between Assigned Name and Team Name
+        cols = list(output_df.columns)
+        if 'Assigned Name' in cols and 'Claim Handler' in cols and 'Team Name' in cols:
+            # Remove these three from their current positions
+            cols.remove('Assigned Name')
+            cols.remove('Claim Handler')
+            cols.remove('Team Name')
+            # Find a good insertion point (after any existing claim columns)
+            # We'll put them after the main claim identification columns
+            insert_idx = 0
+            for i, col in enumerate(cols):
+                if any(x in col.lower() for x in ['claim', 'date', 'country', 'division', 'customer']):
+                    insert_idx = i + 1
+            # Insert in the desired order
+            cols.insert(insert_idx, 'Assigned Name')
+            cols.insert(insert_idx + 1, 'Claim Handler')
+            cols.insert(insert_idx + 2, 'Team Name')
+            output_df = output_df[cols]
+        
+        return output_df
 
     def get_stats(self):
         return dict(self.load_counter)
@@ -299,6 +320,28 @@ class ClaimProcessor:
         r = row.copy()
         if 'Claim: Claim Number' in r.index:
             r = r.rename({'Claim: Claim Number': 'Claim Import ID'})
+        
+        # Format Date of Loss properly (convert Excel serial if needed)
+        dol = row.get('Date of Loss')
+        if pd.notna(dol):
+            try:
+                # If it's a string, parse it
+                if isinstance(dol, str):
+                    dol = pd.to_datetime(dol, dayfirst=True)
+                # If it's a number (Excel serial), convert it
+                elif isinstance(dol, (int, float)):
+                    # Excel date serial (days since 1899-12-30)
+                    dol = pd.to_datetime('1899-12-30') + timedelta(days=float(dol))
+                # Format the Date of Loss column
+                r['Date of Loss'] = dol.strftime('%d.%m.%Y')
+                # Calculate Timebar dates (both client and liable party)
+                timebar = dol + timedelta(days=365)
+                r['Timebar date client'] = timebar.strftime('%d.%m.%Y')
+                r['Timebar date liable party'] = timebar.strftime('%d.%m.%Y')
+            except:
+                pass
+        
+        # Assignment columns - order matters!
         r['Assigned Name'] = rid or '#N/A'
         r['Claim Handler'] = handler.name if handler else ''
         r['Team Name'] = team_name
@@ -306,14 +349,10 @@ class ClaimProcessor:
         r['Internal Status'] = 'Awaiting own process'
         r['Recovery Status'] = 'Awaiting own process'
         r['Initial assignment'] = self.today.strftime('%d.%m.%Y')
+        
         if str(row.get('Status', '')).strip().lower() == 'new':
             r['Status'] = 'Assigned'
-        dol = row.get('Date of Loss')
-        if pd.notna(dol):
-            try:
-                if isinstance(dol, str): dol = pd.to_datetime(dol, dayfirst=True)
-                r['Timebar date client'] = (dol + timedelta(days=365)).strftime('%d.%m.%Y')
-            except: pass
+        
         return r
 
     def _log_history(self, row, handler, team_name, rid, reason):
@@ -334,8 +373,20 @@ class ClaimProcessor:
 
 @st.cache_resource
 def get_session():
-    db_path = "/tmp/claim_engine_v2.db"
-    engine = create_engine(f"sqlite:///{db_path}", connect_args={"check_same_thread": False})
+    # Turso cloud DB (when deployed) or local SQLite (for development)
+    turso_url = os.environ.get("TURSO_DATABASE_URL") or st.secrets.get("TURSO_DATABASE_URL", "")
+    turso_token = os.environ.get("TURSO_AUTH_TOKEN") or st.secrets.get("TURSO_AUTH_TOKEN", "")
+
+    if turso_url and turso_token:
+        # Remote Turso — persistent cloud database
+        engine = create_engine(
+            f"sqlite+libsql://{turso_url.replace('libsql://', '').replace('https://', '')}?secure=true",
+            connect_args={"auth_token": turso_token},
+        )
+    else:
+        # Local SQLite — for development / testing
+        os.makedirs('data', exist_ok=True)
+        engine = create_engine('sqlite:///data/claim_engine_v2.db', connect_args={"check_same_thread": False})
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine)
     session = Session()
@@ -534,7 +585,7 @@ def main():
 
     # Sidebar: Team selection + Admin login
     with st.sidebar:
-        st.title("🎯 Claim Engine v2.0")
+        st.title("🎯 Claim Engine")
         teams = session.query(Team).all()
         team_options = {t.display_name: t.name for t in teams}
         selected_display = st.selectbox("Active Team", list(team_options.keys()),
@@ -582,7 +633,7 @@ def main():
                         st.error("Złe hasło")
 
         st.divider()
-        st.caption(f"v2.0 • Streamlit Edition")
+        st.caption("Streamlit Edition")
 
     is_admin = st.session_state['is_admin']
 
@@ -996,8 +1047,17 @@ def main():
     # ====================================================================
     elif page == "📅 Attendance":
         st.header(f"📅 Attendance — {selected_display}")
+        if not is_admin: st.info("🔒 Zaloguj się jako admin aby edytować.")
 
         handlers = session.query(Handler).filter_by(team_id=team.id).order_by(Handler.team_name, Handler.name).all()
+
+        col1, col2, _ = st.columns([1, 1, 3])
+        if col1.button("✅ All Present", disabled=not is_admin):
+            for h in handlers: h.is_present = True
+            session.commit(); st.rerun()
+        if col2.button("❌ All Absent", disabled=not is_admin):
+            for h in handlers: h.is_present = False
+            session.commit(); st.rerun()
 
         current_team = None
         for h in handlers:
@@ -1008,7 +1068,8 @@ def main():
             new_val = st.checkbox(
                 f"{h.name}  `{h.riskonnect_id}`",
                 value=h.is_present,
-                key=f"att_{h.id}"
+                key=f"att_{h.id}",
+                disabled=not is_admin
             )
             if new_val != h.is_present:
                 h.is_present = new_val
