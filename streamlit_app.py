@@ -431,7 +431,7 @@ def get_session():
         )
     
     # Create tables - with IF NOT EXISTS for Turso, checkfirst=False avoids PRAGMA
-    Base.metadata.create_all(engine, checkfirst=False)
+    Base.metadata.create_all(engine, checkfirst=True)
     
     Session = sessionmaker(bind=engine)
     session = Session()
