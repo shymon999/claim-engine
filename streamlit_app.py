@@ -7,7 +7,7 @@ import pandas as pd
 import os, io
 from datetime import datetime, timedelta
 from collections import Counter
-from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, DateTime, ForeignKey, Text
+from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, DateTime, ForeignKey, Text, pool
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 
 st.set_page_config(page_title="Claim Engine", page_icon="🎯", layout="wide")
@@ -379,14 +379,25 @@ def get_session():
 
     if turso_url and turso_token:
         # Remote Turso — persistent cloud database
+        # Clean the URL: remove protocol prefixes  
+        clean_url = turso_url.replace('libsql://', '').replace('https://', '')
+        
+        # Create engine with libsql compatibility settings
         engine = create_engine(
-            f"sqlite+libsql://{turso_url.replace('libsql://', '').replace('https://', '')}?secure=true",
+            f"sqlite+libsql://{clean_url}",
             connect_args={"auth_token": turso_token},
+            poolclass=pool.StaticPool,  # Use StaticPool for cloud database
+            isolation_level=None,       # Disable isolation level checks
+            pool_pre_ping=False,        # Disable connection ping
+            echo=False
         )
     else:
         # Local SQLite — for development / testing
         os.makedirs('data', exist_ok=True)
-        engine = create_engine('sqlite:///data/claim_engine_v2.db', connect_args={"check_same_thread": False})
+        engine = create_engine(
+            'sqlite:///data/claim_engine.db',
+            connect_args={"check_same_thread": False}
+        )
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine)
     session = Session()
