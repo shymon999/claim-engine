@@ -468,13 +468,14 @@ def get_engine():
         return _create_local_engine(), False
 
 
+@st.cache_resource
 def get_session():
-    """Get a fresh session per Streamlit rerun."""
+    """Get cached session. For single-user Streamlit Cloud this is safe and fast."""
     engine, is_turso = get_engine()
     Session = sessionmaker(bind=engine)
     session = Session()
 
-    # Check if seeded
+    # Check if seeded (runs only once thanks to cache)
     try:
         if session.query(Team).count() > 0:
             return session, is_turso
