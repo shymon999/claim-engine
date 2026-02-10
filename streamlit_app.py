@@ -384,7 +384,8 @@ def get_session():
         clean_url = turso_url.replace('libsql://', '').replace('https://', '')
         
         engine = create_engine(
-            f"sqlite+libsql://:{turso_token}@{clean_url}",
+            f"sqlite+libsql://{clean_url}?secure=true",
+            connect_args={"auth_token": turso_token},
             poolclass=pool.StaticPool,
             echo=False
         )
