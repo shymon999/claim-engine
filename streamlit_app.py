@@ -1,13 +1,13 @@
 """
-CLAIM ENGINE — Streamlit Web Edition
-Deploy free on Streamlit Community Cloud.
+CLAIM ENGINE — Streamlit Cloud Edition
+Deploy on Streamlit Community Cloud with Turso DB for persistence.
 """
 import streamlit as st
 import pandas as pd
-import os, io
+import os, io, json
 from datetime import datetime, timedelta
 from collections import Counter
-from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, DateTime, ForeignKey, Text, pool, event
+from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, DateTime, ForeignKey, Text, pool, text
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 
 st.set_page_config(page_title="Claim Engine", page_icon="🎯", layout="wide")
@@ -15,7 +15,7 @@ st.set_page_config(page_title="Claim Engine", page_icon="🎯", layout="wide")
 Base = declarative_base()
 
 # ============================================================================
-# MODELS (identical to desktop)
+# MODELS
 # ============================================================================
 
 class Team(Base):
@@ -127,6 +127,19 @@ def normalize_division(div):
     if 'contract' in div.lower() and 'logistic' in div.lower(): return 'Contract Logistics'
     return div
 
+def normalize_name_for_match(name):
+    """Normalize Polish characters for fuzzy matching."""
+    replacements = {
+        'ą': 'a', 'ć': 'c', 'ę': 'e', 'ł': 'l', 'ń': 'n',
+        'ó': 'o', 'ś': 's', 'ź': 'z', 'ż': 'z',
+        'Ą': 'A', 'Ć': 'C', 'Ę': 'E', 'Ł': 'L', 'Ń': 'N',
+        'Ó': 'O', 'Ś': 'S', 'Ź': 'Z', 'Ż': 'Z',
+    }
+    result = name
+    for pl, ascii_char in replacements.items():
+        result = result.replace(pl, ascii_char)
+    return result.lower().strip()
+
 def handler_name_by_id(session, hid):
     h = session.get(Handler, int(hid))
     return h.name if h else '?'
@@ -141,7 +154,6 @@ def handler_names_from_ids(session, ids_str):
     return ', '.join(names)
 
 def all_handlers_dict(session):
-    """Returns {display_str: handler_id} for all handlers."""
     d = {}
     for h in session.query(Handler).order_by(Handler.team_name, Handler.name).all():
         d[f"{h.name} [{h.team_name}]"] = h.id
@@ -149,7 +161,7 @@ def all_handlers_dict(session):
 
 
 # ============================================================================
-# CLAIM PROCESSOR (identical logic to desktop)
+# CLAIM PROCESSOR
 # ============================================================================
 
 class ClaimProcessor:
@@ -158,6 +170,14 @@ class ClaimProcessor:
         self.team = team
         self.load_counter = Counter()
         self.today = datetime.now()
+        # Pre-load today's history for better load balancing
+        today_start = self.today.replace(hour=0, minute=0, second=0, microsecond=0)
+        today_history = session.query(History).filter(History.timestamp >= today_start).all()
+        for h in today_history:
+            if h.handler_rid and h.handler_rid != '#N/A':
+                handler = session.query(Handler).filter_by(riskonnect_id=h.handler_rid).first()
+                if handler:
+                    self.load_counter[handler.id] = self.load_counter.get(handler.id, 0) + 1
 
     def process_dataframe(self, df):
         results = []
@@ -167,26 +187,21 @@ class ClaimProcessor:
             results.append(self._build_output(row, handler, team_name, rid, reason))
         self.session.commit()
         output_df = pd.DataFrame(results)
-        
-        # Reorder columns: ensure Claim Handler is between Assigned Name and Team Name
+
         cols = list(output_df.columns)
         if 'Assigned Name' in cols and 'Claim Handler' in cols and 'Team Name' in cols:
-            # Remove these three from their current positions
             cols.remove('Assigned Name')
             cols.remove('Claim Handler')
             cols.remove('Team Name')
-            # Find a good insertion point (after any existing claim columns)
-            # We'll put them after the main claim identification columns
             insert_idx = 0
             for i, col in enumerate(cols):
                 if any(x in col.lower() for x in ['claim', 'date', 'country', 'division', 'customer']):
                     insert_idx = i + 1
-            # Insert in the desired order
             cols.insert(insert_idx, 'Assigned Name')
             cols.insert(insert_idx + 1, 'Claim Handler')
             cols.insert(insert_idx + 2, 'Team Name')
             output_df = output_df[cols]
-        
+
         return output_df
 
     def get_stats(self):
@@ -202,8 +217,10 @@ class ClaimProcessor:
         dol = row.get('Date of Loss')
         if pd.notna(dol):
             if isinstance(dol, str):
-                try: dol = pd.to_datetime(dol, dayfirst=True)
-                except: dol = None
+                try:
+                    dol = pd.to_datetime(dol, dayfirst=True)
+                except (ValueError, TypeError):
+                    dol = None
         else:
             dol = None
 
@@ -211,11 +228,9 @@ class ClaimProcessor:
         liability = self._safe_float(row.get('Total liability EUR', 0))
         eff_amt = min(claim_amt, liability) if claim_amt > 0 and liability > 0 else max(claim_amt, liability)
 
-        # STEP 0: Schenker
         sr = self._check_schenker(shipment, country, division, dol)
         if sr: return sr
 
-        # STEP 1: Special Customers
         for sc in self.session.query(SpecialCustomer).filter_by(is_active=True).all():
             if sc.customer_name.lower() in claimant.lower():
                 hids = [int(x) for x in sc.handler_ids.split(',') if x.strip().isdigit()]
@@ -224,7 +239,6 @@ class ClaimProcessor:
                 h = self._pick(handlers)
                 if h: return h, h.team_name or 'CHC Global', h.riskonnect_id, f'Special: {sc.customer_name}'
 
-        # STEP 2: VIP Customers
         for vip in self.session.query(VIPCustomer).filter_by(is_active=True).order_by(VIPCustomer.priority).all():
             if vip.customer_name.lower() not in claimant.lower(): continue
             if vip.country and vip.country.lower() != country.lower(): continue
@@ -238,7 +252,6 @@ class ClaimProcessor:
                 self.load_counter[bh.id] += 1
                 return bh, bh.team_name or 'CHC Nordic', bh.riskonnect_id, f'VIP Backup: {vip.customer_name}'
 
-        # STEP 3: Rules
         rules = (self.session.query(Rule).filter(Rule.team_id == self.team.id, Rule.is_active == True)
                  .order_by(Rule.priority, Rule.id).all())
         for rule in rules:
@@ -260,18 +273,22 @@ class ClaimProcessor:
         merge_map = {}
         for cfg in configs:
             merge_map.setdefault(cfg.country, []).append((cfg.division, cfg.merge_month))
+
+        cutoff_year = datetime.now().year + 1
+        merge_year = cutoff_year - 1
+
         if country not in merge_map:
-            if dol and dol.year >= 2026: return None
+            if dol and dol.year >= cutoff_year: return None
             return None, 'Claims Schenker Legacy', '#N/A', f'Schenker: {country} not in config'
         if not dol:
             return None, 'Claims Schenker Legacy', '#N/A', 'Schenker: no DoL'
-        if dol.year >= 2026: return None
-        if dol.year == 2025:
+        if dol.year >= cutoff_year: return None
+        if dol.year == merge_year:
             for div_cfg, mm in merge_map[country]:
                 if div_cfg == 'all' or normalize_division(div_cfg) == division:
-                    if dol >= datetime(2025, mm, 1): return None
-            return None, 'Claims Schenker Legacy', '#N/A', f'Schenker Legacy: {country} DoL 2025'
-        return None, 'Claims Schenker Legacy', '#N/A', 'Schenker Legacy: DoL < 2025'
+                    if dol >= datetime(merge_year, mm, 1): return None
+            return None, 'Claims Schenker Legacy', '#N/A', f'Schenker Legacy: {country} DoL {merge_year}'
+        return None, 'Claims Schenker Legacy', '#N/A', f'Schenker Legacy: DoL < {merge_year}'
 
     def _rule_matches(self, rule, country, division, sub_type, claimant, eff_amt):
         if rule.countries:
@@ -313,35 +330,30 @@ class ClaimProcessor:
         return sel
 
     def _safe_float(self, v):
-        try: return float(v) if pd.notna(v) else 0.0
-        except: return 0.0
+        try:
+            return float(v) if pd.notna(v) else 0.0
+        except (ValueError, TypeError):
+            return 0.0
 
     def _build_output(self, row, handler, team_name, rid, reason):
         r = row.copy()
         if 'Claim: Claim Number' in r.index:
             r = r.rename({'Claim: Claim Number': 'Claim Import ID'})
-        
-        # Format Date of Loss properly (convert Excel serial if needed)
+
         dol = row.get('Date of Loss')
         if pd.notna(dol):
             try:
-                # If it's a string, parse it
                 if isinstance(dol, str):
                     dol = pd.to_datetime(dol, dayfirst=True)
-                # If it's a number (Excel serial), convert it
                 elif isinstance(dol, (int, float)):
-                    # Excel date serial (days since 1899-12-30)
                     dol = pd.to_datetime('1899-12-30') + timedelta(days=float(dol))
-                # Format the Date of Loss column
                 r['Date of Loss'] = dol.strftime('%d.%m.%Y')
-                # Calculate Timebar dates (both client and liable party)
                 timebar = dol + timedelta(days=365)
                 r['Timebar date client'] = timebar.strftime('%d.%m.%Y')
                 r['Timebar date liable party'] = timebar.strftime('%d.%m.%Y')
-            except:
+            except (ValueError, TypeError, OverflowError):
                 pass
-        
-        # Assignment columns - order matters!
+
         r['Assigned Name'] = rid or '#N/A'
         r['Claim Handler'] = handler.name if handler else ''
         r['Team Name'] = team_name
@@ -349,10 +361,9 @@ class ClaimProcessor:
         r['Internal Status'] = 'Awaiting own process'
         r['Recovery Status'] = 'Awaiting own process'
         r['Initial assignment'] = self.today.strftime('%d.%m.%Y')
-        
+
         if str(row.get('Status', '')).strip().lower() == 'new':
             r['Status'] = 'Assigned'
-        
         return r
 
     def _log_history(self, row, handler, team_name, rid, reason):
@@ -368,79 +379,122 @@ class ClaimProcessor:
 
 
 # ============================================================================
-# DATABASE INIT + SEED
+# DATABASE — Turso (cloud) or SQLite (local dev)
 # ============================================================================
 
-@st.cache_resource
-def get_session():
-    # Turso cloud DB (when deployed) or local SQLite (for development)
-    turso_url = os.environ.get("TURSO_DATABASE_URL") or st.secrets.get("TURSO_DATABASE_URL", "")
-    turso_token = os.environ.get("TURSO_AUTH_TOKEN") or st.secrets.get("TURSO_AUTH_TOKEN", "")
+def _patch_turso_dialect():
+    """
+    Patch SQLAlchemy's SQLite dialect to skip all PRAGMA queries.
+    Turso/libSQL doesn't support PRAGMA — these patches prevent:
+    - get_isolation_level / set_isolation_level (PRAGMA read_uncommitted)
+    - _get_server_version_info (PRAGMA that crashes on Turso)
+    - get_default_isolation_level
+    """
+    from sqlalchemy.dialects.sqlite import base as sqlite_base
+    from sqlalchemy.dialects.sqlite import pysqlite
 
-    is_turso = bool(turso_url and turso_token)
-    
-    if is_turso:
-        # Remote Turso — persistent cloud database
-        clean_url = turso_url.replace('libsql://', '').replace('https://', '')
-        
-        engine = create_engine(
-            f"sqlite+libsql://{clean_url}?secure=true",
-            connect_args={"auth_token": turso_token},
-            poolclass=pool.StaticPool,
-            echo=False
-        )
-        
-        # Monkey-patch to avoid PRAGMA queries (Turso doesn't support them)
-        from sqlalchemy.dialects.sqlite import base
-        
-        def _skip_isolation_get(self, dbapi_connection):
-            return None
-        
-        def _skip_isolation_set(self, dbapi_connection, level):
-            pass
-        
-        base.SQLiteDialect.get_isolation_level = _skip_isolation_get
-        base.SQLiteDialect.set_isolation_level = _skip_isolation_set
-        
-        # Create tables with IF NOT EXISTS — avoids both PRAGMA and duplicate errors
-        from sqlalchemy.schema import CreateTable
-        with engine.connect() as conn:
-            for table in Base.metadata.sorted_tables:
+    # Skip isolation level entirely
+    sqlite_base.SQLiteDialect.get_isolation_level = lambda self, conn: None
+    sqlite_base.SQLiteDialect.set_isolation_level = lambda self, conn, level: None
+    sqlite_base.SQLiteDialect.get_default_isolation_level = lambda self, conn: None
+
+    # Return a safe fake version instead of running PRAGMA
+    sqlite_base.SQLiteDialect._get_server_version_info = lambda self, conn: (3, 40, 0)
+
+    # Disable the "first connect" event that triggers PRAGMAs
+    original_on_connect = getattr(sqlite_base.SQLiteDialect, 'on_connect', None)
+    sqlite_base.SQLiteDialect.on_connect = lambda self: None
+
+    # Also patch pysqlite if present
+    if hasattr(pysqlite, 'PySQLiteDialect'):
+        pysqlite.PySQLiteDialect.get_isolation_level = lambda self, conn: None
+        pysqlite.PySQLiteDialect.set_isolation_level = lambda self, conn, level: None
+        pysqlite.PySQLiteDialect.get_default_isolation_level = lambda self, conn: None
+        pysqlite.PySQLiteDialect._get_server_version_info = lambda self, conn: (3, 40, 0)
+        pysqlite.PySQLiteDialect.on_connect = lambda self: None
+
+
+def _create_turso_engine(turso_url, turso_token):
+    """Create engine for Turso cloud DB."""
+    _patch_turso_dialect()
+
+    clean_url = turso_url.replace('libsql://', '').replace('https://', '')
+    engine = create_engine(
+        f"sqlite+libsql://{clean_url}?secure=true",
+        connect_args={"auth_token": turso_token},
+        poolclass=pool.StaticPool,
+        echo=False,
+    )
+
+    # Create tables using IF NOT EXISTS (no PRAGMA needed)
+    from sqlalchemy.schema import CreateTable
+    with engine.connect() as conn:
+        for table in Base.metadata.sorted_tables:
+            try:
                 stmt = CreateTable(table, if_not_exists=True)
                 conn.execute(stmt)
-            conn.commit()
-        
+            except Exception:
+                pass  # Table already exists
+        conn.commit()
+
+    return engine
+
+
+def _create_local_engine():
+    """Create engine for local SQLite (development)."""
+    os.makedirs('data', exist_ok=True)
+    engine = create_engine(
+        'sqlite:///data/claim_engine.db',
+        connect_args={"check_same_thread": False}
+    )
+    Base.metadata.create_all(engine)
+    return engine
+
+
+@st.cache_resource
+def get_engine():
+    """Create DB engine once (cached). Session is created per-rerun."""
+    turso_url = ""
+    turso_token = ""
+    try:
+        turso_url = os.environ.get("TURSO_DATABASE_URL") or st.secrets.get("TURSO_DATABASE_URL", "")
+        turso_token = os.environ.get("TURSO_AUTH_TOKEN") or st.secrets.get("TURSO_AUTH_TOKEN", "")
+    except Exception:
+        pass
+
+    if turso_url and turso_token:
+        return _create_turso_engine(turso_url, turso_token), True
     else:
-        # Local SQLite — for development / testing
-        os.makedirs('data', exist_ok=True)
-        engine = create_engine(
-            'sqlite:///data/claim_engine.db',
-            connect_args={"check_same_thread": False}
-        )
-        Base.metadata.create_all(engine)
-    
+        return _create_local_engine(), False
+
+
+def get_session():
+    """Get a fresh session per Streamlit rerun."""
+    engine, is_turso = get_engine()
     Session = sessionmaker(bind=engine)
     session = Session()
 
-    # Check if already seeded
+    # Check if seeded
     try:
-        team_count = session.query(Team).count()
-        if team_count > 0:
-            return session
-    except:
-        # Continue with seeding
+        if session.query(Team).count() > 0:
+            return session, is_turso
+    except Exception:
         pass
 
-    # Teams
+    _seed_database(session)
+    return session, is_turso
+
+
+def _seed_database(session):
+    """Seed database with initial data."""
     teams = {}
     for name, display in [('Global', 'CHC Global'), ('Nordic', 'CHC Nordic'),
                            ('Bucharest', 'CHC Bucharest'), ('Doc', 'CHC Doc Team')]:
         t = Team(name=name, display_name=display)
         session.add(t); session.flush(); teams[name] = t
 
-    # Handlers
     hd = {}
-    for name, rid, tname, tkey in [
+    handler_data = [
         ('Agata Więckowska', '005Ts000002590X', 'CHC Global', 'Global'),
         ('Hubert Zych', '005Ts00000GGV9tIAH', 'CHC Global', 'Global'),
         ('Justyna Klepczyńska-Buczek', '005Ts0000025CY1', 'CHC Global', 'Global'),
@@ -461,14 +515,13 @@ def get_session():
         ('Angelic Arellano', '005Ts00000259QA', 'CHC Doc Team', 'Doc'),
         ('Arianne Dimalanta', '005Ts00000259UP', 'CHC Doc Team', 'Doc'),
         ('Chris-Ann Bautista', '005Ts000006oQdN', 'CHC Doc Team', 'Doc'),
-    ]:
+    ]
+    for name, rid, tname, tkey in handler_data:
         h = Handler(name=name, riskonnect_id=rid, team_name=tname, team_id=teams[tkey].id)
         session.add(h); session.flush(); hd[name] = h
 
-    # Backup
     hd['Weronika Kruszewska'].backup_handler_id = hd['Jakub Kowalski'].id
 
-    # Sub-types
     for name, cat in [
         ('Damage', 'damage'), ('Water Damage', 'damage'), ('Hidden Damage', 'damage'),
         ('Temperature Damage', 'damage'), ('Contamination', 'damage'),
@@ -478,12 +531,10 @@ def get_session():
     ]:
         session.add(ClaimSubType(name=name, category=cat))
 
-    # Special customers
     j_o = f"{hd['Justyna Klepczyńska-Buczek'].id},{hd['Oliwia Hagowska'].id}"
     for c in ['Abbott', 'Adidas', 'Autoliv', 'HP', 'Estee Lauder', 'WD - WESTERN DIGITAL', 'Burberry', 'SATAIR']:
         session.add(SpecialCustomer(customer_name=c, handler_ids=j_o))
 
-    # Schenker config
     for country, div, month in [
         ('USA', 'all', 8), ('Denmark', 'all', 8),
         ('UK', 'all', 9), ('Switzerland', 'all', 9), ('Netherlands', 'A&S', 9),
@@ -502,7 +553,6 @@ def get_session():
 
     razvan = hd['Razvan Poenaru']
 
-    # Global rules from CSV
     csv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'rules_full.csv')
     ft_config = {
         ('Belgium', 'Road'): (200, 500), ('Czech', 'Road'): (200, 500),
@@ -519,8 +569,20 @@ def get_session():
             divs = ','.join(normalize_division(d.strip()) for d in str(row['Division']).split(','))
             main_str = str(row['Main Handler(s)']).strip()
             alt_str = str(row.get('Alternative', '')).strip()
-            main_ids = [str(hd[n].id) for n in hd if n in main_str]
-            alt_ids = [str(hd[n].id) for n in hd if alt_str and alt_str != '-' and n in alt_str]
+
+            main_ids = []
+            for real_name, handler_obj in hd.items():
+                last_name = normalize_name_for_match(real_name).split()[-1]
+                if last_name in normalize_name_for_match(main_str):
+                    main_ids.append(str(handler_obj.id))
+
+            alt_ids = []
+            if alt_str and alt_str != '-':
+                for real_name, handler_obj in hd.items():
+                    last_name = normalize_name_for_match(real_name).split()[-1]
+                    if last_name in normalize_name_for_match(alt_str):
+                        alt_ids.append(str(handler_obj.id))
+
             session.add(Rule(team_id=teams['Global'].id, priority=50,
                 description=f"{country} {divs}", countries=country, divisions=divs,
                 handler_ids=','.join(main_ids) or None,
@@ -534,12 +596,10 @@ def get_session():
                     min_amount=ft_min if ft_min > 0 else None, max_amount=ft_max,
                     handler_ids=str(razvan.id), output_team_name='CHC Bucharest'))
 
-    # XPress
     session.add(Rule(team_id=teams['Global'].id, priority=5,
         description='XPress all countries', divisions='XPress',
         handler_ids=f"{hd['Oliwia Hagowska'].id},{hd['Łukasz Twarowski'].id}"))
 
-    # Nordic rules
     session.add(Rule(team_id=teams['Nordic'].id, priority=10,
         description='Low Value <200 (DK,EE,LT,LV,NO,FI)',
         countries='Denmark,Estonia,Lithuania,Latvia,Norway,Finland', max_amount=200,
@@ -587,7 +647,6 @@ def get_session():
         claim_sub_types='Damage,Water Damage,Hidden Damage,Temperature Damage,Contamination', min_amount=200,
         handler_ids=f"{hd['Weronika Kruszewska'].id},{hd['Amelia Falk'].id},{hd['Tomasz Wasil'].id},{hd['Michał Sztorc'].id}"))
 
-    # VIP
     for cust, country, hname, mn, mx, prio in [
         ('IKEA', 'Sweden', 'Weronika Kruszewska', 200, 999999, 10),
         ('Forbo', 'Sweden', 'Weronika Kruszewska', 200, 999999, 10),
@@ -606,7 +665,72 @@ def get_session():
             handler_id=hd[hname].id, min_amount=mn, max_amount=mx, priority=prio))
 
     session.commit()
-    return session
+
+
+# ============================================================================
+# CONFIG EXPORT
+# ============================================================================
+
+def export_config(session):
+    config = {
+        'exported_at': datetime.now().isoformat(),
+        'handlers': [], 'rules': [], 'vip_customers': [],
+        'special_customers': [], 'schenker_config': [], 'claim_sub_types': [],
+    }
+    for h in session.query(Handler).all():
+        config['handlers'].append({
+            'name': h.name, 'riskonnect_id': h.riskonnect_id,
+            'team_name': h.team_name, 'is_present': h.is_present,
+            'backup_handler_rid': h.backup_handler.riskonnect_id if h.backup_handler else None,
+        })
+    for r in session.query(Rule).all():
+        t = session.get(Team, r.team_id)
+        config['rules'].append({
+            'team': t.name if t else '', 'priority': r.priority,
+            'description': r.description, 'is_active': r.is_active,
+            'countries': r.countries, 'divisions': r.divisions,
+            'claim_sub_types': r.claim_sub_types, 'customer_contains': r.customer_contains,
+            'min_amount': r.min_amount, 'max_amount': r.max_amount,
+            'handler_rids': ','.join(
+                session.get(Handler, int(hid)).riskonnect_id
+                for hid in (r.handler_ids or '').split(',')
+                if hid.strip().isdigit() and session.get(Handler, int(hid))
+            ) or None,
+            'backup_handler_rids': ','.join(
+                session.get(Handler, int(hid)).riskonnect_id
+                for hid in (r.backup_handler_ids or '').split(',')
+                if hid.strip().isdigit() and session.get(Handler, int(hid))
+            ) or None,
+            'output_team_name': r.output_team_name,
+            'output_assigned_name': r.output_assigned_name,
+        })
+    for v in session.query(VIPCustomer).all():
+        h = session.get(Handler, v.handler_id)
+        config['vip_customers'].append({
+            'customer_name': v.customer_name, 'country': v.country,
+            'handler_rid': h.riskonnect_id if h else '',
+            'min_amount': v.min_amount, 'max_amount': v.max_amount,
+            'is_active': v.is_active, 'priority': v.priority,
+        })
+    for s in session.query(SpecialCustomer).all():
+        config['special_customers'].append({
+            'customer_name': s.customer_name, 'is_active': s.is_active,
+            'handler_rids': ','.join(
+                session.get(Handler, int(hid)).riskonnect_id
+                for hid in (s.handler_ids or '').split(',')
+                if hid.strip().isdigit() and session.get(Handler, int(hid))
+            ),
+        })
+    for c in session.query(SchenkerConfig).all():
+        config['schenker_config'].append({
+            'country': c.country, 'division': c.division,
+            'merge_month': c.merge_month, 'is_active': c.is_active,
+        })
+    for st_obj in session.query(ClaimSubType).all():
+        config['claim_sub_types'].append({
+            'name': st_obj.name, 'category': st_obj.category, 'is_active': st_obj.is_active,
+        })
+    return json.dumps(config, indent=2, ensure_ascii=False)
 
 
 # ============================================================================
@@ -614,15 +738,18 @@ def get_session():
 # ============================================================================
 
 def main():
-    session = get_session()
+    session, is_turso = get_session()
 
-    # Admin authentication
     if 'is_admin' not in st.session_state:
         st.session_state['is_admin'] = False
 
-    # Sidebar: Team selection + Admin login
     with st.sidebar:
         st.title("🎯 Claim Engine")
+        if is_turso:
+            st.caption("☁️ Turso Cloud DB")
+        else:
+            st.caption("💾 Local SQLite (dev mode)")
+
         teams = session.query(Team).all()
         team_options = {t.display_name: t.name for t in teams}
         selected_display = st.selectbox("Active Team", list(team_options.keys()),
@@ -641,15 +768,16 @@ def main():
             "📅 Attendance",
             "🏷️ Sub-Types",
             "📜 History",
+            "⚙️ Settings",
         ])
 
         st.divider()
 
-        # Admin login/logout
-        admin_pw = os.environ.get("ADMIN_PASSWORD") or ""
+        admin_pw = ""
         try:
-            admin_pw = admin_pw or st.secrets.get("ADMIN_PASSWORD", "")
-        except: pass
+            admin_pw = os.environ.get("ADMIN_PASSWORD") or st.secrets.get("ADMIN_PASSWORD", "")
+        except Exception:
+            pass
 
         if st.session_state['is_admin']:
             st.success("🔓 Admin")
@@ -670,7 +798,7 @@ def main():
                         st.error("Złe hasło")
 
         st.divider()
-        st.caption("Streamlit Edition")
+        st.caption("v2.0 — Streamlit Edition")
 
     is_admin = st.session_state['is_admin']
 
@@ -701,7 +829,6 @@ def main():
 
             st.success(f"✅ Processed **{len(result_df)}** claims")
 
-            # Stats
             col1, col2, col3 = st.columns(3)
             assigned = len(result_df[result_df['Assigned Name'] != '#N/A']) if 'Assigned Name' in result_df.columns else 0
             unmatched = len(result_df) - assigned
@@ -718,7 +845,6 @@ def main():
                 if stats_data:
                     st.dataframe(pd.DataFrame(stats_data), use_container_width=True, hide_index=True)
 
-            # Results table
             st.subheader("Results")
             key_cols = ['Claim Import ID', 'Claim: Claim Number', 'DSV Country (Lookup)',
                         'DSV Division (Lookup)', 'Claim Sub-Type', 'Claimant Name',
@@ -728,7 +854,6 @@ def main():
             st.dataframe(result_df[show_cols] if show_cols else result_df,
                          use_container_width=True, height=400)
 
-            # Downloads
             st.subheader("Download")
             c1, c2 = st.columns(2)
             csv_buf = result_df.to_csv(index=False).encode('utf-8')
@@ -754,8 +879,7 @@ def main():
             data = []
             for r in rules:
                 data.append({
-                    "ID": r.id,
-                    "Prio": r.priority,
+                    "ID": r.id, "Prio": r.priority,
                     "Description": r.description or '',
                     "Countries": r.countries or 'ALL',
                     "Divisions": r.divisions or 'ALL',
@@ -769,7 +893,6 @@ def main():
                 })
             st.dataframe(pd.DataFrame(data), use_container_width=True, hide_index=True, height=400)
 
-        # Add / Edit / Delete
         if not is_admin:
             st.info("🔒 Zaloguj się jako admin aby edytować reguły.")
         st.subheader("Manage Rules")
@@ -796,12 +919,12 @@ def main():
                 col1, col2 = st.columns(2)
                 out_team = col1.text_input("Output Team Name (override)", placeholder="leave empty for handler's team")
                 out_assigned = col2.selectbox("Output Assigned Name", ['', '#N/A'])
-                is_active = st.checkbox("Active", True)
+                is_active_add = st.checkbox("Active", True)
 
                 if st.form_submit_button("💾 Save Rule", type="primary", disabled=not is_admin):
                     r = Rule(
                         team_id=team.id, priority=priority, description=desc or None,
-                        is_active=is_active,
+                        is_active=is_active_add,
                         countries=countries.strip() or None,
                         divisions=','.join(divs) or None,
                         claim_sub_types=','.join(sts) or None,
@@ -859,9 +982,11 @@ def main():
 
                     col1, col2 = st.columns(2)
                     out_team = col1.text_input("Output Team", rule.output_team_name or '', key="ed_ot")
-                    oa_idx = ['', '#N/A'].index(rule.output_assigned_name) if rule.output_assigned_name in ['', '#N/A'] else 0
-                    out_assigned = col2.selectbox("Output Assigned", ['', '#N/A'], index=oa_idx, key="ed_oa")
-                    is_active = st.checkbox("Active", rule.is_active, key="ed_act")
+                    oa_options = ['', '#N/A']
+                    oa_val = rule.output_assigned_name or ''
+                    oa_idx = oa_options.index(oa_val) if oa_val in oa_options else 0
+                    out_assigned = col2.selectbox("Output Assigned", oa_options, index=oa_idx, key="ed_oa")
+                    is_active_edit = st.checkbox("Active", rule.is_active, key="ed_act")
 
                     if st.form_submit_button("💾 Update Rule", type="primary", disabled=not is_admin):
                         rule.description = desc or None; rule.priority = priority
@@ -875,7 +1000,7 @@ def main():
                         rule.backup_handler_ids = ','.join(str(all_h[h]) for h in backups) or None
                         rule.output_team_name = out_team.strip() or None
                         rule.output_assigned_name = out_assigned or None
-                        rule.is_active = is_active
+                        rule.is_active = is_active_edit
                         session.commit(); st.success("Updated!"); st.rerun()
 
         with tab_del:
@@ -991,13 +1116,13 @@ def main():
     elif page == "🚛 Schenker Config":
         st.header("🚛 Schenker Merge Configuration")
         if not is_admin: st.info("🔒 Zaloguj się jako admin aby edytować.")
-        st.info("Shipments without DSV dash are checked here. Country + division + merge month in 2025.")
+        st.info("Shipments without DSV dash are checked here. Country + division + merge month.")
 
         configs = session.query(SchenkerConfig).filter_by(is_active=True).order_by(
             SchenkerConfig.merge_month, SchenkerConfig.country).all()
         if configs:
             data = [{"ID": c.id, "Country": c.country, "Division": c.division,
-                     "Merge Month (2025)": c.merge_month} for c in configs]
+                     "Merge Month": c.merge_month} for c in configs]
             st.dataframe(pd.DataFrame(data), use_container_width=True, hide_index=True)
 
         tab_add, tab_del = st.tabs(["➕ Add", "🗑️ Delete"])
@@ -1005,7 +1130,7 @@ def main():
             with st.form("add_sch"):
                 country = st.text_input("Country")
                 div = st.selectbox("Division", ['all'] + DIVISIONS)
-                month = st.number_input("Merge Month (2025)", 1, 12, 8)
+                month = st.number_input("Merge Month", 1, 12, 8)
                 if st.form_submit_button("💾 Save", disabled=not is_admin):
                     session.add(SchenkerConfig(country=country, division=div, merge_month=month))
                     session.commit(); st.success("Added!"); st.rerun()
@@ -1101,7 +1226,6 @@ def main():
             if h.team_name != current_team:
                 current_team = h.team_name
                 st.subheader(current_team or 'Unknown')
-
             new_val = st.checkbox(
                 f"{h.name}  `{h.riskonnect_id}`",
                 value=h.is_present,
@@ -1147,19 +1271,60 @@ def main():
     elif page == "📜 History":
         st.header("📜 Processing History")
 
-        history = session.query(History).order_by(History.timestamp.desc()).limit(300).all()
+        col1, col2, col3 = st.columns(3)
+        search_term = col1.text_input("🔍 Search", key="hist_search")
+        date_from = col2.date_input("From", value=datetime.now() - timedelta(days=30), key="hist_from")
+        date_to = col3.date_input("To", value=datetime.now(), key="hist_to")
+
+        query = session.query(History).filter(
+            History.timestamp >= datetime.combine(date_from, datetime.min.time()),
+            History.timestamp <= datetime.combine(date_to, datetime.max.time())
+        )
+        if search_term:
+            term = f"%{search_term}%"
+            query = query.filter(
+                (History.claim_number.like(term)) |
+                (History.handler_name.like(term)) |
+                (History.country.like(term)) |
+                (History.claimant.like(term))
+            )
+        history = query.order_by(History.timestamp.desc()).limit(500).all()
+
         if history:
+            st.caption(f"Showing {len(history)} records")
             data = [{"Time": h.timestamp.strftime('%Y-%m-%d %H:%M') if h.timestamp else '',
                      "Claim #": h.claim_number, "Country": h.country,
                      "Division": h.division, "Claimant": (h.claimant or '')[:30],
+                     "Amount": f"{h.amount:.0f}" if h.amount else '',
                      "Handler": h.handler_name, "Team": h.team_name,
                      "Reason": h.reason} for h in history]
             st.dataframe(pd.DataFrame(data), use_container_width=True, height=500, hide_index=True)
         else:
-            st.info("No history yet. Process some claims first.")
+            st.info("No history matching the criteria.")
 
         if st.button("🗑️ Clear All History", disabled=not is_admin):
             session.query(History).delete(); session.commit(); st.rerun()
+
+    # ====================================================================
+    # SETTINGS
+    # ====================================================================
+    elif page == "⚙️ Settings":
+        st.header("⚙️ Settings")
+
+        st.subheader("📤 Export Configuration")
+        if st.button("📤 Export Config to JSON"):
+            config_json = export_config(session)
+            st.download_button("💾 Download config.json", config_json,
+                               "claim_engine_config.json", "application/json")
+
+        st.divider()
+        st.subheader("ℹ️ Info")
+        st.text(f"Database: {'☁️ Turso Cloud' if is_turso else '💾 Local SQLite'}")
+        st.text(f"Teams: {session.query(Team).count()}")
+        st.text(f"Handlers: {session.query(Handler).count()}")
+        st.text(f"Rules: {session.query(Rule).count()}")
+        st.text(f"VIP Customers: {session.query(VIPCustomer).count()}")
+        st.text(f"History records: {session.query(History).count()}")
 
 
 if __name__ == '__main__':
