@@ -81,8 +81,8 @@ class SchenkerConfig(Base):
     id = Column(Integer, primary_key=True)
     country = Column(String(100))
     division = Column(String(100), default='all')
-    merge_month = Column(Integer)
     is_active = Column(Boolean, default=True)
+    schenker_legacy_override = Column(Boolean, default=False)  # True = always Legacy even if merged (e.g. France Road)
 
 class ClaimSubType(Base):
     __tablename__ = 'claim_sub_types'
@@ -268,27 +268,59 @@ class ClaimProcessor:
         return None, '', '#N/A', 'No matching rule'
 
     def _check_schenker(self, shipment, country, division, dol):
-        if not shipment or '-' in shipment: return None
+        """
+        Schenker logic (shipment number without '-'):
+        1. No DoL or DoL before merge year (2025) → always Schenker Legacy
+        2. DoL >= cutoff year (2026+) → not a Schenker legacy issue, process normally
+        3. DoL in merge year (2025):
+           a. Country+division found in config with legacy_override=True → Schenker Legacy
+              (e.g. France Road — always legacy regardless of merge)
+           b. Country+division found in config (merged) → we handle it (return None)
+           c. Country NOT in config at all → Schenker Legacy
+           d. Country in config but division doesn't match → Schenker Legacy
+        """
+        if not shipment or '-' in shipment:
+            return None
+
         configs = self.session.query(SchenkerConfig).filter_by(is_active=True).all()
+
+        # Build lookup: country → list of (division, legacy_override)
         merge_map = {}
         for cfg in configs:
-            merge_map.setdefault(cfg.country, []).append((cfg.division, cfg.merge_month))
+            merge_map.setdefault(cfg.country, []).append(
+                (cfg.division, cfg.schenker_legacy_override)
+            )
 
-        cutoff_year = datetime.now().year + 1
-        merge_year = cutoff_year - 1
+        cutoff_year = datetime.now().year + 1   # 2026
+        merge_year = cutoff_year - 1            # 2025
 
-        if country not in merge_map:
-            if dol and dol.year >= cutoff_year: return None
-            return None, 'Claims Schenker Legacy', '#N/A', f'Schenker: {country} not in config'
+        # No date of loss → Legacy
         if not dol:
             return None, 'Claims Schenker Legacy', '#N/A', 'Schenker: no DoL'
-        if dol.year >= cutoff_year: return None
-        if dol.year == merge_year:
-            for div_cfg, mm in merge_map[country]:
-                if div_cfg == 'all' or normalize_division(div_cfg) == division:
-                    if dol >= datetime(merge_year, mm, 1): return None
-            return None, 'Claims Schenker Legacy', '#N/A', f'Schenker Legacy: {country} DoL {merge_year}'
-        return None, 'Claims Schenker Legacy', '#N/A', f'Schenker Legacy: DoL < {merge_year}'
+
+        # DoL >= 2026 → not a Schenker legacy issue, process normally
+        if dol.year >= cutoff_year:
+            return None
+
+        # DoL < 2025 → always Legacy (old claims)
+        if dol.year < merge_year:
+            return None, 'Claims Schenker Legacy', '#N/A', f'Schenker Legacy: DoL < {merge_year}'
+
+        # DoL in 2025 — check if country is merged
+        if country not in merge_map:
+            return None, 'Claims Schenker Legacy', '#N/A', f'Schenker Legacy: {country} not merged in {merge_year}'
+
+        # Country IS in config — check if division matches
+        for div_cfg, legacy_override in merge_map[country]:
+            if div_cfg == 'all' or normalize_division(div_cfg) == division:
+                if legacy_override:
+                    return None, 'Claims Schenker Legacy', '#N/A', \
+                        f'Schenker Legacy override: {country} {division}'
+                return None  # Merged — we handle it
+
+        # Country in config but this specific division is NOT merged
+        return None, 'Claims Schenker Legacy', '#N/A', \
+            f'Schenker Legacy: {country}/{division} not merged in {merge_year}'
 
     def _rule_matches(self, rule, country, division, sub_type, claimant, eff_amt):
         if rule.countries:
@@ -536,21 +568,44 @@ def _seed_database(session):
     for c in ['Abbott', 'Adidas', 'Autoliv', 'HP', 'Estee Lauder', 'WD - WESTERN DIGITAL', 'Burberry', 'SATAIR']:
         session.add(SpecialCustomer(customer_name=c, handler_ids=j_o))
 
-    for country, div, month in [
-        ('USA', 'all', 8), ('Denmark', 'all', 8),
-        ('UK', 'all', 9), ('Switzerland', 'all', 9), ('Netherlands', 'A&S', 9),
-        ('Norway', 'A&S', 9), ('Chile', 'A&S', 9), ('Chile', 'Road', 9), ('Panama', 'A&S', 9),
-        ('Ireland', 'all', 10), ('Spain', 'A&S', 10), ('Spain', 'Contract Logistics', 10),
-        ('Portugal', 'A&S', 10), ('Myanmar', 'A&S', 10), ('Myanmar', 'Contract Logistics', 10), ('Laos', 'A&S', 10),
-        ('Belgium', 'all', 11), ('Hong Kong', 'all', 11), ('South Africa', 'all', 11),
-        ('Bangladesh', 'all', 11), ('Norway', 'Road', 11), ('Luxembourg', 'A&S', 11),
-        ('Luxembourg', 'Road', 11), ('Peru', 'A&S', 11), ('Peru', 'Contract Logistics', 11), ('Mozambique', 'A&S', 11),
-        ('Italy', 'all', 12), ('Finland', 'all', 12), ('Taiwan', 'all', 12),
-        ('Philippines', 'all', 12), ('Dubai', 'all', 12), ('Estonia', 'all', 12),
-        ('Egypt', 'all', 12), ('Croatia', 'all', 12), ('Netherlands', 'Road', 12),
-        ('Netherlands', 'Contract Logistics', 12), ('Greece', 'A&S', 12), ('Puerto Rico', 'A&S', 12),
-    ]:
-        session.add(SchenkerConfig(country=country, division=div, merge_month=month))
+    # Schenker merged countries/divisions (2025)
+    # schenker_legacy_override=True means: even though merged, these are ALWAYS Schenker Legacy
+    # (e.g. France Road — all Road claims with Schenker number are legacy)
+    schenker_entries = [
+        # August merges
+        ('USA', 'all', False), ('Denmark', 'all', False),
+        # September merges
+        ('UK', 'all', False), ('Switzerland', 'all', False),
+        ('Netherlands', 'A&S', False), ('Norway', 'A&S', False),
+        ('Chile', 'A&S', False), ('Chile', 'Road', False), ('Panama', 'A&S', False),
+        # October merges
+        ('Ireland', 'all', False),
+        ('Spain', 'A&S', False), ('Spain', 'Contract Logistics', False),
+        ('Portugal', 'A&S', False),
+        ('Myanmar', 'A&S', False), ('Myanmar', 'Contract Logistics', False),
+        ('Laos', 'A&S', False),
+        # November merges
+        ('Belgium', 'all', False), ('Hong Kong', 'all', False),
+        ('South Africa', 'all', False), ('Bangladesh', 'all', False),
+        ('Norway', 'Road', False), ('Luxembourg', 'A&S', False),
+        ('Luxembourg', 'Road', False),
+        ('Peru', 'A&S', False), ('Peru', 'Contract Logistics', False),
+        ('Mozambique', 'A&S', False),
+        ('China', 'A&S', False),
+        # December merges
+        ('Italy', 'all', False), ('Finland', 'all', False),
+        ('Taiwan', 'all', False), ('Philippines', 'all', False),
+        ('Dubai', 'all', False), ('Estonia', 'all', False),
+        ('Egypt', 'all', False), ('Croatia', 'all', False),
+        ('Netherlands', 'Road', False), ('Netherlands', 'Contract Logistics', False),
+        ('Greece', 'A&S', False), ('Puerto Rico', 'A&S', False),
+        # Legacy overrides — these are merged but Schenker claims still go to Legacy
+        ('France', 'Road', True),  # All France Road with Schenker number → Legacy
+    ]
+    for country, div, legacy in schenker_entries:
+        session.add(SchenkerConfig(
+            country=country, division=div, schenker_legacy_override=legacy
+        ))
 
     razvan = hd['Razvan Poenaru']
 
@@ -725,7 +780,8 @@ def export_config(session):
     for c in session.query(SchenkerConfig).all():
         config['schenker_config'].append({
             'country': c.country, 'division': c.division,
-            'merge_month': c.merge_month, 'is_active': c.is_active,
+            'is_active': c.is_active,
+            'schenker_legacy_override': c.schenker_legacy_override,
         })
     for st_obj in session.query(ClaimSubType).all():
         config['claim_sub_types'].append({
@@ -1117,27 +1173,47 @@ def main():
     elif page == "🚛 Schenker Config":
         st.header("🚛 Schenker Merge Configuration")
         if not is_admin: st.info("🔒 Zaloguj się jako admin aby edytować.")
-        st.info("Shipments without DSV dash are checked here. Country + division + merge month.")
+        st.info("""**Logika:** Szkoda z numerem Schenker (bez '-') i DoL w 2025:
+• Kraj+dywizja na liście → **obsługujemy** (chyba że Legacy Override = ✅)
+• Kraj/dywizja NIE na liście → **Schenker Legacy**
+• Legacy Override = ✅ → zawsze Schenker Legacy (np. France Road)""")
 
         configs = session.query(SchenkerConfig).filter_by(is_active=True).order_by(
-            SchenkerConfig.merge_month, SchenkerConfig.country).all()
+            SchenkerConfig.country).all()
         if configs:
             data = [{"ID": c.id, "Country": c.country, "Division": c.division,
-                     "Merge Month": c.merge_month} for c in configs]
+                     "Legacy Override": "⚠️ YES" if c.schenker_legacy_override else "—"
+                     } for c in configs]
             st.dataframe(pd.DataFrame(data), use_container_width=True, hide_index=True)
 
-        tab_add, tab_del = st.tabs(["➕ Add", "🗑️ Delete"])
+        tab_add, tab_edit, tab_del = st.tabs(["➕ Add", "✏️ Edit", "🗑️ Delete"])
         with tab_add:
             with st.form("add_sch"):
                 country = st.text_input("Country")
                 div = st.selectbox("Division", ['all'] + DIVISIONS)
-                month = st.number_input("Merge Month", 1, 12, 8)
+                legacy = st.checkbox("Legacy Override (always Schenker Legacy even if merged)", False)
                 if st.form_submit_button("💾 Save", disabled=not is_admin):
-                    session.add(SchenkerConfig(country=country, division=div, merge_month=month))
+                    session.add(SchenkerConfig(
+                        country=country, division=div, schenker_legacy_override=legacy
+                    ))
                     session.commit(); st.success("Added!"); st.rerun()
+        with tab_edit:
+            if configs:
+                opts = {f"{c.country} / {c.division}" + (" ⚠️LEGACY" if c.schenker_legacy_override else ""): c.id for c in configs}
+                sel = st.selectbox("Select to edit", list(opts.keys()), key="edit_sch")
+                cfg = session.get(SchenkerConfig, opts[sel])
+                with st.form("edit_sch"):
+                    country = st.text_input("Country", cfg.country)
+                    div = st.selectbox("Division", ['all'] + DIVISIONS,
+                        index=(['all'] + DIVISIONS).index(cfg.division) if cfg.division in ['all'] + DIVISIONS else 0)
+                    legacy = st.checkbox("Legacy Override", cfg.schenker_legacy_override)
+                    if st.form_submit_button("💾 Update", disabled=not is_admin):
+                        cfg.country = country; cfg.division = div
+                        cfg.schenker_legacy_override = legacy
+                        session.commit(); st.success("Updated!"); st.rerun()
         with tab_del:
             if configs:
-                opts = {f"{c.country} / {c.division} / month {c.merge_month}": c.id for c in configs}
+                opts = {f"{c.country} / {c.division}": c.id for c in configs}
                 sel = st.selectbox("Select", list(opts.keys()), key="del_sch")
                 if st.button("🗑️ Delete", disabled=not is_admin):
                     c = session.get(SchenkerConfig, opts[sel])
