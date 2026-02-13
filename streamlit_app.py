@@ -467,6 +467,19 @@ def _create_turso_engine(turso_url, turso_token):
                 conn.execute(stmt)
             except Exception:
                 pass  # Table already exists
+
+        # --- Migrations for existing databases ---
+        # Add schenker_legacy_override column if missing (v2.1 migration)
+        try:
+            conn.execute(text(
+                "ALTER TABLE schenker_config ADD COLUMN schenker_legacy_override BOOLEAN DEFAULT 0"
+            ))
+        except Exception:
+            pass  # Column already exists
+
+        # Drop merge_month column — SQLite/libSQL doesn't support DROP COLUMN easily,
+        # so we just leave it and ignore it. The ORM won't query it.
+
         conn.commit()
 
     return engine
@@ -480,6 +493,17 @@ def _create_local_engine():
         connect_args={"check_same_thread": False}
     )
     Base.metadata.create_all(engine)
+
+    # --- Migrations for existing databases ---
+    with engine.connect() as conn:
+        try:
+            conn.execute(text(
+                "ALTER TABLE schenker_config ADD COLUMN schenker_legacy_override BOOLEAN DEFAULT 0"
+            ))
+            conn.commit()
+        except Exception:
+            pass  # Column already exists
+
     return engine
 
 
