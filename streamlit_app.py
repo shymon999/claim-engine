@@ -330,7 +330,7 @@ class ClaimProcessor:
         if rule.claim_sub_types:
             if not any(s.strip().lower() in sub_type.lower() for s in rule.claim_sub_types.split(',')): return False
         if rule.customer_contains:
-            if rule.customer_contains.lower() not in claimant.lower(): return False
+            if not any(c.strip().lower() in claimant.lower() for c in rule.customer_contains.split(',')): return False
         if rule.min_amount is not None and eff_amt < rule.min_amount: return False
         if rule.max_amount is not None and eff_amt >= rule.max_amount: return False
         return True
