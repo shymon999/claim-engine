@@ -287,7 +287,7 @@ class ClaimProcessor:
 
         # 2. Special customers (from cache)
         for sc in self._specials:
-            if sc.customer_name.lower() in claimant.lower():
+            if normalize_name_for_match(sc.customer_name) in normalize_name_for_match(claimant):
                 hids = [int(x) for x in sc.handler_ids.split(',') if x.strip().isdigit()]
                 handlers = [self.hcache.by_id.get(hid) for hid in hids]
                 handlers = [h for h in handlers if h and h.is_present]
@@ -300,15 +300,9 @@ class ClaimProcessor:
             if vip.country and vip.country.lower() != country.lower(): continue
             if not (vip.min_amount <= eff_amt < vip.max_amount): continue
             h = self.hcache.by_id.get(vip.handler_id)
-            if h and h.is_present:
+            if h:
                 self.load_counter[h.id] += 1
                 return h, h.team_name or 'CHC Nordic', h.riskonnect_id, f'VIP: {vip.customer_name} ({eff_amt:.0f} EUR)'
-            elif h:
-                bk_id = self.hcache.backup_map.get(h.id)
-                bh = self.hcache.by_id.get(bk_id) if bk_id else None
-                if bh and bh.is_present:
-                    self.load_counter[bh.id] += 1
-                    return bh, bh.team_name or 'CHC Nordic', bh.riskonnect_id, f'VIP Backup: {vip.customer_name}'
 
         # 4. Rules (from cache)
         for rule in self._rules:
