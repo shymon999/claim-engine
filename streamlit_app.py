@@ -911,8 +911,13 @@ def main():
             c1.download_button("📥 CSV", result_df.to_csv(index=False).encode('utf-8'),
                                "claims_output.csv", "text/csv", use_container_width=True)
             xlsx_buf = io.BytesIO()
-            result_df.to_excel(xlsx_buf, index=False, engine='openpyxl')
-            c2.download_button("📥 Excel", xlsx_buf.getvalue(), "claims_output.xlsx",
+            xlsx_df = result_df.rename(columns={
+                'Claim amount EUR': 'Claim amount EUR..',
+                'Total liability EUR': 'Total liability EUR..'
+            })
+            xlsx_df.to_excel(xlsx_buf, index=False, engine='openpyxl')
+            xlsx_filename = f"Rozdanie Nordic {datetime.now().strftime('%d.%m.%Y')}.xlsx"
+            c2.download_button("📥 Excel", xlsx_buf.getvalue(), xlsx_filename,
                                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                                use_container_width=True)
 
