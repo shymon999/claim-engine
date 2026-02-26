@@ -249,16 +249,18 @@ class ClaimProcessor:
         self.session.commit()
         output_df = pd.DataFrame(results)
         cols = list(output_df.columns)
+        if 'Timebar date client' in cols:
+            cols.remove('Timebar date client')
         if 'Assigned Name' in cols and 'Claim Handler' in cols and 'Team Name' in cols:
             cols.remove('Assigned Name'); cols.remove('Claim Handler'); cols.remove('Team Name')
-            insert_idx = 0
-            for i, col in enumerate(cols):
-                if any(x in col.lower() for x in ['claim', 'date', 'country', 'division', 'customer']):
-                    insert_idx = i + 1
+            if 'Claimant Name' in cols:
+                insert_idx = cols.index('Claimant Name') + 1
+            else:
+                insert_idx = len(cols)
             cols.insert(insert_idx, 'Assigned Name')
             cols.insert(insert_idx + 1, 'Claim Handler')
             cols.insert(insert_idx + 2, 'Team Name')
-            output_df = output_df[cols]
+        output_df = output_df[cols]
         return output_df
 
     def get_stats(self):
@@ -401,7 +403,6 @@ class ClaimProcessor:
                     dol = pd.to_datetime('1899-12-30') + timedelta(days=float(dol))
                 r['Date of Loss'] = dol.strftime('%d.%m.%Y')
                 timebar = dol + timedelta(days=365)
-                r['Timebar date client'] = timebar.strftime('%d.%m.%Y')
                 r['Timebar date liable party'] = timebar.strftime('%d.%m.%Y')
             except: pass
         r['Assigned Name'] = rid or '#N/A'
