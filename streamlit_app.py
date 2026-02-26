@@ -4,7 +4,7 @@ Turso Cloud persistence with aggressive caching to eliminate N+1 queries.
 """
 import streamlit as st
 import pandas as pd
-import os, io, json
+import os, io, json, re
 from datetime import datetime, timedelta
 from collections import Counter
 from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, DateTime, ForeignKey, Text, pool, text
@@ -136,6 +136,7 @@ def normalize_name_for_match(name):
     result = name
     for pl, ascii_char in replacements.items():
         result = result.replace(pl, ascii_char)
+    result = re.sub(r'[\s\-\.\,\_]', '', result)
     return result.lower().strip()
 
 
@@ -295,7 +296,7 @@ class ClaimProcessor:
 
         # 3. VIP customers (from cache)
         for vip in self._vips:
-            if vip.customer_name.lower() not in claimant.lower(): continue
+            if normalize_name_for_match(vip.customer_name) not in normalize_name_for_match(claimant): continue
             if vip.country and vip.country.lower() != country.lower(): continue
             if not (vip.min_amount <= eff_amt < vip.max_amount): continue
             h = self.hcache.by_id.get(vip.handler_id)
