@@ -512,9 +512,9 @@ def get_session():
     # Seed if empty
     try:
         if session.query(Team).count() == 0:
-            _seed_database(session)
+            _seed_database(session, force=False)
     except:
-        _seed_database(session)
+        _seed_database(session, force=True)
     return session, is_turso
 
 
@@ -522,7 +522,18 @@ def get_session():
 # SEED DATA — from your edited database
 # ============================================================================
 
-def _seed_database(session):
+def _seed_database(session, force=False):
+    if force:
+        # Hard reset of all seedable tables (use when schema exists but data is inconsistent)
+        session.query(History).delete()
+        session.query(Rule).delete()
+        session.query(VIPCustomer).delete()
+        session.query(SpecialCustomer).delete()
+        session.query(SchenkerConfig).delete()
+        session.query(ClaimSubType).delete()
+        session.query(Handler).delete()
+        session.query(Team).delete()
+        session.commit()
     teams = {}
     for name, display in [('Global', 'CHC Global'), ('Nordic', 'CHC Nordic'),
                            ('Bucharest', 'CHC Bucharest'), ('Doc', 'CHC Doc Team')]:
