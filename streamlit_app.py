@@ -276,7 +276,7 @@ class ClaimProcessor:
         if pd.notna(dol):
             if isinstance(dol, str):
                 try: dol = pd.to_datetime(dol, dayfirst=True)
-                except: dol = None
+                except Exception: dol = None
         else:
             dol = None
         claim_amt = self._safe_float(row.get('Claim amount EUR', 0))
@@ -321,17 +321,16 @@ class ClaimProcessor:
         return None, '', '#N/A', 'No matching rule'
 
     def _check_schenker(self, shipment, country, division, dol):
+        # Schenker shipment numbers don't contain dashes; regular shipments do
         if not shipment or '-' in shipment:
             return None
 
-        # FIXED: Hardcoded merge year
-        MERGE_YEAR = 2025
-        CUTOFF_YEAR = 2026
+        MERGE_YEAR = 2025  # Schenker logic applies only to DoL in 2025
 
         if not dol:
             return None, 'Claims Schenker Legacy', '#N/A', 'Schenker: no DoL'
-        if dol.year >= CUTOFF_YEAR:
-            return None
+        if dol.year > MERGE_YEAR:
+            return None  # After merger year — not Schenker
         if dol.year < MERGE_YEAR:
             return None, 'Claims Schenker Legacy', '#N/A', f'Schenker Legacy: DoL < {MERGE_YEAR}'
 
@@ -389,7 +388,7 @@ class ClaimProcessor:
 
     def _safe_float(self, v):
         try: return float(v) if pd.notna(v) else 0.0
-        except: return 0.0
+        except Exception: return 0.0
 
     def _build_output(self, row, handler, team_name, rid, reason):
         r = row.copy()
@@ -404,7 +403,7 @@ class ClaimProcessor:
                 r['Date of Loss'] = dol.strftime('%d.%m.%Y')
                 timebar = dol + timedelta(days=365)
                 r['Timebar date liable party'] = timebar.strftime('%d.%m.%Y')
-            except: pass
+            except Exception: pass
         r['Assigned Name'] = rid or '#N/A'
         r['Claim Handler'] = handler.name if handler else ''
         r['Team Name'] = team_name
@@ -461,10 +460,10 @@ def _create_turso_engine(turso_url, turso_token):
         for table in Base.metadata.sorted_tables:
             try:
                 conn.execute(CreateTable(table, if_not_exists=True))
-            except: pass
+            except Exception: pass
         try:
             conn.execute(text("ALTER TABLE schenker_config ADD COLUMN schenker_legacy_override BOOLEAN DEFAULT 0"))
-        except: pass
+        except Exception: pass
         conn.commit()
     return engine
 
@@ -478,7 +477,7 @@ def _create_local_engine():
         try:
             conn.execute(text("ALTER TABLE schenker_config ADD COLUMN schenker_legacy_override BOOLEAN DEFAULT 0"))
             conn.commit()
-        except: pass
+        except Exception: pass
     return engine
 
 
@@ -491,7 +490,7 @@ def get_engine():
         try:
             turso_url = os.environ.get("TURSO_DATABASE_URL") or st.secrets.get("TURSO_DATABASE_URL", "")
             turso_token = os.environ.get("TURSO_AUTH_TOKEN") or st.secrets.get("TURSO_AUTH_TOKEN", "")
-        except: pass
+        except Exception: pass
 
     if USE_TURSO and turso_url and turso_token:
         return _create_turso_engine(turso_url, turso_token), True
@@ -506,16 +505,18 @@ def get_session_factory():
 
 
 def get_session():
-    """Get a fresh session for each Streamlit rerun."""
-    factory, is_turso = get_session_factory()
-    session = factory()
-    # Seed if empty
-    try:
-        if session.query(Team).count() == 0:
-            _seed_database(session, force=False)
-    except:
-        _seed_database(session, force=True)
-    return session, is_turso
+    """Reuse session within Streamlit session to avoid connection leaks."""
+    if 'db_session' not in st.session_state:
+        factory, is_turso = get_session_factory()
+        session = factory()
+        try:
+            if session.query(Team).count() == 0:
+                _seed_database(session, force=False)
+        except Exception:
+            session.rollback()
+        st.session_state['db_session'] = session
+        st.session_state['db_is_turso'] = is_turso
+    return st.session_state['db_session'], st.session_state['db_is_turso']
 
 
 # ============================================================================
@@ -562,7 +563,7 @@ def _seed_database(session, force=False):
         ('Angelic Arellano', '005Ts00000259QA', 'CHC Doc Team', 'Doc'),
         ('Arianne Dimalanta', '005Ts00000259UP', 'CHC Doc Team', 'Doc'),
         ('Chris-Ann Bautista', '005Ts000006oQdN', 'CHC Doc Team', 'Doc'),
-        ('Damian ChÄ…chyra', '005Vk00000EigRh', 'CHC Global', 'Global'),
+        ('Damian Chąchyra', '005Vk00000EigRh', 'CHC Global', 'Global'),
         ('Anna Temperato', '005Vk00000H9dgI', 'CHC Global', 'Global'),
     ]
     for name, rid, tname, tkey in handler_data:
@@ -876,7 +877,7 @@ def main():
         admin_pw = ""
         try:
             admin_pw = os.environ.get("ADMIN_PASSWORD") or st.secrets.get("ADMIN_PASSWORD", "")
-        except: pass
+        except Exception: pass
 
         if st.session_state['is_admin']:
             st.success("🔓 Admin")
@@ -952,11 +953,11 @@ def main():
                                "claims_output.csv", "text/csv", use_container_width=True)
             xlsx_buf = io.BytesIO()
             xlsx_df = result_df.rename(columns={
-                'Claim amount EUR': 'Claim amount EUR..',
-                'Total liability EUR': 'Total liability EUR..'
+                'Claim amount EUR': 'Claimed amount EUR',
+                'Total liability EUR': 'Total liabilityy EUR'
             })
             xlsx_df.to_excel(xlsx_buf, index=False, engine='openpyxl')
-            xlsx_filename = f"Rozdanie Nordic {datetime.now().strftime('%d.%m.%Y')}.xlsx"
+            xlsx_filename = f"Rozdanie {selected_display} {datetime.now().strftime('%d.%m.%Y')}.xlsx"
             c2.download_button("📥 Excel", xlsx_buf.getvalue(), xlsx_filename,
                                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                                use_container_width=True)
@@ -1270,10 +1271,14 @@ def main():
                 if st.form_submit_button("💾 Save", disabled=not is_admin):
                     if name and rid:
                         bk_id = all_h_for_backup.get(backup) if backup != '-- None --' else None
-                        session.add(Handler(name=name, riskonnect_id=rid, team_name=tname,
-                            team_id=team.id, backup_handler_id=bk_id))
-                        session.commit(); invalidate_cache()
-                        st.success(f"Added {name}!"); st.rerun()
+                        try:
+                            session.add(Handler(name=name, riskonnect_id=rid, team_name=tname,
+                                team_id=team.id, backup_handler_id=bk_id))
+                            session.commit(); invalidate_cache()
+                            st.success(f"Added {name}!"); st.rerun()
+                        except Exception:
+                            session.rollback()
+                            st.error(f"Błąd: Riskonnect ID '{rid}' już istnieje lub dane są niepoprawne.")
 
         with tab_edit:
             if handlers:
