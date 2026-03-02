@@ -482,15 +482,18 @@ def _create_local_engine():
     return engine
 
 
+USE_TURSO = True  # Set True only if you want to use Turso in this app
+
 @st.cache_resource
 def get_engine():
     turso_url = turso_token = ""
-    try:
-        turso_url = os.environ.get("TURSO_DATABASE_URL") or st.secrets.get("TURSO_DATABASE_URL", "")
-        turso_token = os.environ.get("TURSO_AUTH_TOKEN") or st.secrets.get("TURSO_AUTH_TOKEN", "")
-    except: pass
+    if USE_TURSO:
+        try:
+            turso_url = os.environ.get("TURSO_DATABASE_URL") or st.secrets.get("TURSO_DATABASE_URL", "")
+            turso_token = os.environ.get("TURSO_AUTH_TOKEN") or st.secrets.get("TURSO_AUTH_TOKEN", "")
+        except: pass
 
-    if turso_url and turso_token:
+    if USE_TURSO and turso_url and turso_token:
         return _create_turso_engine(turso_url, turso_token), True
     else:
         return _create_local_engine(), False
@@ -548,6 +551,8 @@ def _seed_database(session):
         ('Angelic Arellano', '005Ts00000259QA', 'CHC Doc Team', 'Doc'),
         ('Arianne Dimalanta', '005Ts00000259UP', 'CHC Doc Team', 'Doc'),
         ('Chris-Ann Bautista', '005Ts000006oQdN', 'CHC Doc Team', 'Doc'),
+        ('Damian ChÄ…chyra', '005Vk00000EigRh', 'CHC Global', 'Global'),
+        ('Anna Temperato', '005Vk00000H9dgI', 'CHC Global', 'Global'),
     ]
     for name, rid, tname, tkey in handler_data:
         h = Handler(name=name, riskonnect_id=rid, team_name=tname, team_id=teams[tkey].id)
@@ -565,7 +570,7 @@ def _seed_database(session):
         session.add(ClaimSubType(name=name, category=cat))
 
     j_o = f"{hd['Justyna Klepczyńska-Buczek'].id},{hd['Oliwia Hagowska'].id}"
-    for c in ['Abbott', 'Adidas', 'Autoliv', 'HP', 'Estee Lauder', 'WD - WESTERN DIGITAL', 'Burberry', 'SATAIR']:
+    for c in ['Abbott', 'Adidas', 'Autoliv', 'HP', 'Estee Lauder', 'WD - WESTERN DIGITAL', 'Burberry', 'SATAIR', 'LEGO']:
         session.add(SpecialCustomer(customer_name=c, handler_ids=j_o))
 
     # Schenker config
@@ -602,14 +607,16 @@ def _seed_database(session):
     G = teams['Global'].id
     # XPress
     session.add(Rule(team_id=G, priority=5, description='XPress all countries',
-        divisions='XPress', handler_ids=f"{hd['Oliwia Hagowska'].id},{hd['Łukasz Twarowski'].id}"))
+        divisions='XPress', handler_ids=f"{hd['Oliwia Hagowska'].id}"))
 
     # Fast Track rules
     ft_rules = [
-        ('Belgium', 'Road', 200, 500), ('Czech', 'Road', 200, 500),
-        ('France', 'Road', None, 200), ('Ireland', 'Solutions', None, 200),
-        ('Ireland', 'Road', None, 200), ('Netherlands', 'Road', 200, 500),
-        ('Portugal', 'Road', None, 200), ('Spain', 'Road', None, 200),
+        ('Belgium', 'Road', 200, 500),
+        ('France', 'Road', 200, 500),
+        ('Ireland', 'Road', 200, 500),
+        ('Netherlands', 'Road', 200, 500),
+        ('Portugal', 'Road', 200, 500),
+        ('Spain', 'Road', 200, 500),
         ('UK', 'Road', 200, 500),
     ]
     for country, div, mn, mx in ft_rules:
@@ -621,30 +628,52 @@ def _seed_database(session):
 
     # Standard Global rules
     global_rules = [
-        ('Austria', 'A&S', '1', None),
-        ('Belgium', 'Road', '5', '3,4'), ('Belgium', 'A&S', '3', '6'),
-        ('Bulgaria', 'A&S', '6', '3'),
-        ('Czech', 'A&S', '6', '1'), ('Czech', 'Road', '1', '2'),
-        ('Denmark', 'A&S', '6', '1'),
-        ('Estonia', 'A&S', '6', None),
-        ('Finland', 'A&S', '6', '1'),
-        ('France', 'Road', '4,3,7', None), ('France', 'A&S', '3', '6'), ('France', 'Solutions', '4', '3'),
+        ('Andorra', 'A&S', '6,1', None),
+        ('Austria', 'A&S', '1,6', None),
+        ('Belarus', 'A&S', '6,1', None),
+        ('Belgium', 'A&S', '3,6', None),
+        ('Belgium', 'Road', '5,3,4', None),
+        ('Bosnia and Herzegovina', 'A&S', '6,1', None),
+        ('Bulgaria', 'A&S', '6,3', None),
+        ('Croatia', 'A&S', '6,1', None),
+        ('Czech', 'A&S', '6,1', None),
+        ('Denmark', 'A&S', '21,6,1', None),
+        ('Estonia', 'A&S', '1,6', None),
+        ('Finland', 'A&S', '6,1', None),
+        ('France', 'A&S', '3,6', None),
+        ('France', 'Contract Logistics', '4,3', None),
+        ('France', 'Road', '4,3,7', None),
         ('Germany', 'A&S', '6,1', None),
-        ('Hungary', 'A&S', '6', '1'),
-        ('Ireland', 'Solutions,Road', '5', '1'), ('Ireland', 'A&S', '6', '1'),
-        ('Italy', 'Road', '2', None), ('Italy', 'A&S', '6', '3'),
-        ('Latvia', 'A&S', '1', '6'), ('Lithuania', 'A&S', '1', '6'),
-        ('Luxembourg', 'A&S', '6', '3'),
-        ('Netherlands', 'Road', '5', '3,4'), ('Netherlands', 'A&S', '3', '6'),
-        ('Norway', 'A&S', '6', '3'),
-        ('Poland', 'A&S', '1', '3'), ('Poland', 'Road', '2', None),
-        ('Portugal', 'Road', '4', '3'), ('Portugal', 'A&S', '6', '3'),
-        ('Romania', 'A&S', '6', '1'),
-        ('Spain', 'Road', '4,3', None), ('Spain', 'A&S', '6,3', '4'), ('Spain', 'Solutions', '4', '3'),
-        ('Sweden', 'A&S', '6', None),
-        ('Switzerland', 'A&S', '6', '1'),
-        ('Turkey', 'Solutions,Road', None, None), ('Turkey', 'A&S', '6', None),
-        ('UK', 'Road', '1,5', None), ('UK', 'Solutions', '1,5', None), ('UK', 'A&S', '6', None),
+        ('Greece', 'A&S', '6,1', None),
+        ('Hungary', 'A&S', '6,1', None),
+        ('Ireland', 'A&S', '6,1', None),
+        ('Ireland', 'Road,Contract Logistics', '5,1', None),
+        ('Italy', 'A&S', '6,3', None),
+        ('Italy', 'Road', '2,22', None),
+        ('Latvia', 'A&S', '1,6', None),
+        ('Lithuania', 'A&S', '1,6', None),
+        ('Luxembourg', 'A&S', '6,3', None),
+        ('Netherlands', 'A&S', '3,6', None),
+        ('Netherlands', 'Road', '5,3,4', None),
+        ('Norway', 'A&S', '6,3', None),
+        ('Poland', 'A&S', '1,3', None),
+        ('Portugal', 'A&S', '6,3', None),
+        ('Portugal', 'Road', '4,3', None),
+        ('Romania', 'A&S', '6,1', None),
+        ('Serbia', 'A&S', '6,1', None),
+        ('Slovakia', 'A&S', '6,1', None),
+        ('Slovenia', 'A&S', '6,1', None),
+        ('Spain', 'A&S', '6,3,4', None),
+        ('Spain', 'Contract Logistics', '4,3', None),
+        ('Spain', 'Road', '4,3', None),
+        ('Sweden', 'A&S', '6,1', None),
+        ('Switzerland', 'A&S', '6,1', None),
+        ('Turkey', 'A&S', '6', None),
+        ('Turkey', 'Road,Contract Logistics', '1', None),
+        ('UK', 'A&S', '6', None),
+        ('UK', 'Contract Logistics', '1,5', None),
+        ('UK', 'Road', '1,5', None),
+        ('Ukraine', 'A&S', '6,1', None),
     ]
     for country, divs, main_ids, backup_ids in global_rules:
         session.add(Rule(team_id=G, priority=50, description=f"{country} {divs}",
