@@ -391,7 +391,7 @@ class ClaimProcessor:
         except Exception: return 0.0
 
     def _build_output(self, row, handler, team_name, rid, reason):
-        r = row.copy()
+        r = row.copy().astype(object)
         if 'Claim: Claim Number' in r.index:
             r = r.rename({'Claim: Claim Number': 'Claim Import ID'})
         dol = row.get('Date of Loss')
