@@ -1037,19 +1037,20 @@ def main():
                 rule_options = {f"#{r.id} [P{r.priority}] {r.description or r.countries or '?'}": r.id for r in rules}
                 sel = st.selectbox("Select rule to edit", list(rule_options.keys()), key="edit_rule_sel")
                 rule = session.get(Rule, rule_options[sel])
-                with st.form("edit_rule"):
+                rid = rule.id
+                with st.form(f"edit_rule_{rid}"):
                     desc = st.text_input("Description", rule.description or '')
                     priority = st.number_input("Priority", 1, 999, rule.priority)
                     countries = st.text_input("Countries", rule.countries or '')
                     col1, col2 = st.columns(2)
                     cur_divs = [d.strip() for d in (rule.divisions or '').split(',') if d.strip()]
-                    divs = col1.multiselect("Divisions", DIVISIONS, default=cur_divs, key="ed_div")
+                    divs = col1.multiselect("Divisions", DIVISIONS, default=cur_divs, key=f"ed_div_{rid}")
                     cur_sts = [s.strip() for s in (rule.claim_sub_types or '').split(',') if s.strip()]
-                    sts = col2.multiselect("Sub-Types", subtypes, default=[s for s in cur_sts if s in subtypes], key="ed_st")
+                    sts = col2.multiselect("Sub-Types", subtypes, default=[s for s in cur_sts if s in subtypes], key=f"ed_st_{rid}")
                     customer = st.text_input("Customer contains", rule.customer_contains or '')
                     col1, col2 = st.columns(2)
-                    min_amt = col1.number_input("Min EUR", 0, 9999999, int(rule.min_amount or 0), key="ed_mn")
-                    max_amt = col2.number_input("Max EUR", 0, 9999999, int(rule.max_amount or 0), key="ed_mx")
+                    min_amt = col1.number_input("Min EUR", 0, 9999999, int(rule.min_amount or 0), key=f"ed_mn_{rid}")
+                    max_amt = col2.number_input("Max EUR", 0, 9999999, int(rule.max_amount or 0), key=f"ed_mx_{rid}")
 
                     cur_main = []
                     if rule.handler_ids:
@@ -1057,7 +1058,7 @@ def main():
                             if hid.strip().isdigit():
                                 key = f"{hcache.name(int(hid.strip()))} [{hcache.team_names_map.get(int(hid.strip()), '')}]"
                                 if key in all_h_names: cur_main.append(key)
-                    handlers = st.multiselect("Main Handlers", all_h_names, default=cur_main, key="ed_hnd")
+                    handlers = st.multiselect("Main Handlers", all_h_names, default=cur_main, key=f"ed_hnd_{rid}")
 
                     cur_bk = []
                     if rule.backup_handler_ids:
@@ -1065,15 +1066,15 @@ def main():
                             if hid.strip().isdigit():
                                 key = f"{hcache.name(int(hid.strip()))} [{hcache.team_names_map.get(int(hid.strip()), '')}]"
                                 if key in all_h_names: cur_bk.append(key)
-                    backups = st.multiselect("Backup", all_h_names, default=cur_bk, key="ed_bk")
+                    backups = st.multiselect("Backup", all_h_names, default=cur_bk, key=f"ed_bk_{rid}")
 
                     col1, col2 = st.columns(2)
-                    out_team = col1.text_input("Output Team", rule.output_team_name or '', key="ed_ot")
+                    out_team = col1.text_input("Output Team", rule.output_team_name or '', key=f"ed_ot_{rid}")
                     oa_options = ['', '#N/A']
                     oa_val = rule.output_assigned_name or ''
                     out_assigned = col2.selectbox("Output Assigned", oa_options,
-                        index=oa_options.index(oa_val) if oa_val in oa_options else 0, key="ed_oa")
-                    is_active_edit = st.checkbox("Active", rule.is_active, key="ed_act")
+                        index=oa_options.index(oa_val) if oa_val in oa_options else 0, key=f"ed_oa_{rid}")
+                    is_active_edit = st.checkbox("Active", rule.is_active, key=f"ed_act_{rid}")
 
                     if st.form_submit_button("💾 Update", type="primary", disabled=not is_admin):
                         rule.description = desc or None; rule.priority = priority
